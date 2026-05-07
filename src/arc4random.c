@@ -51,7 +51,7 @@
 #include <libop_config.h>
 #include <op_lib.h>
 
-#if !defined(HAVE_WOLFSSL) && !defined(HAVE_ARC4RANDOM)
+#if !defined(HAVE_OPSSL) && !defined(HAVE_ARC4RANDOM)
 
 #include "arc4random.h"
 
@@ -319,4 +319,4 @@ arc4random(void)
 	return val;
 }
 
-#endif /* !HAVE_WOLFSSL && !HAVE_ARC4RANDOM */
+#endif /* !HAVE_OPSSL && !HAVE_ARC4RANDOM */

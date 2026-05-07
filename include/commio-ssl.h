@@ -55,13 +55,11 @@ void op_get_ssl_info(char *buf, size_t length);
  * and the kernel handles TLS encryption/decryption transparently.
  *
  * kTLS is activated for TLS 1.2 and TLS 1.3 connections using AES-GCM or
- * ChaCha20-Poly1305 immediately after the handshake.  Two paths are supported:
- *   HAVE_WOLFSSL_KTLS  — wolfSSL compiled with native kTLS; it calls
- *                        setsockopt internally and manages I/O bypass.
- *   HAVE_KERNEL_TLS    — ophion calls setsockopt itself using wolfSSL's
- *                        key-extraction APIs; wolfSSL is bypassed for I/O.
- * Returns false when neither path is available or the cipher suite is
- * unsupported (e.g. CBC mode).
+ * ChaCha20-Poly1305 immediately after the handshake.  When HAVE_KERNEL_TLS
+ * is defined, ophion extracts keys via the opssl key-extraction API, calls
+ * setsockopt(SOL_TLS) itself, and bypasses the TLS library for I/O.
+ * Returns false when kTLS is unavailable or the cipher suite is unsupported
+ * (e.g. CBC mode).
  */
 bool op_ssl_is_ktls(op_fde_t *F);
 
@@ -80,8 +78,8 @@ void op_fde_mark_ktls(op_fde_t *F);
  * op_ssl_promote_ktls — late kTLS promotion for an established TLS connection.
  *
  * Unlike the handshake-time promotion, this reads the CURRENT TX and RX
- * sequence numbers from the live wolfSSL session so the kernel kTLS state
- * picks up exactly where wolfSSL left off.
+ * sequence numbers from the live TLS session so the kernel kTLS state
+ * picks up exactly where the TLS library left off.
  *
  * Intended use: upgrade drain phase — call before serialising a TLS client
  * so that connections not promoted at handshake time (e.g. TLS 1.2 clients
@@ -94,26 +92,25 @@ void op_fde_mark_ktls(op_fde_t *F);
 int op_ssl_promote_ktls(op_fde_t *F);
 
 /*
- * op_ssl_export — export the complete wolfSSL session state into buf.
+ * op_ssl_export — export the complete TLS session state into buf.
  *
- * Uses wolfSSL_tls_export() to serialise keys, IVs, sequence numbers, and
- * cipher-suite parameters.  The resulting blob can be transferred alongside
- * the raw socket FD to a new process, which calls op_ssl_adopt_exported() to
- * resume the TLS session without the kernel tls module.
+ * Serialises keys, IVs, sequence numbers, and cipher-suite parameters.
+ * The resulting blob can be transferred alongside the raw socket FD to a
+ * new process, which calls op_ssl_adopt_exported() to resume the TLS
+ * session without the kernel tls module.
  *
  * Returns the number of bytes written into buf (> 0) on success, or -1 if
- * the session state could not be exported (wolfSSL not built with
- * WOLFSSL_SESSION_EXPORT, or F has no active session).
+ * the session state could not be exported or F has no active session.
  *
  * buf must be at least MIGRATE_SSL_EXPORT_MAX bytes.
  */
 int op_ssl_export(op_fde_t *F, uint8_t *buf, size_t buflen);
 
 /*
- * op_ssl_adopt_exported — reconstruct a wolfSSL session from an export blob.
+ * op_ssl_adopt_exported — reconstruct a TLS session from an export blob.
  *
  * Called in the new binary after adopting a live-migrated socket FD.  Creates
- * a fresh WOLFSSL object from the global ssl_ctx, imports the previously
+ * a fresh TLS connection from the global context, imports the previously
  * exported session state, and attaches it to F so that subsequent
  * op_ssl_read()/op_ssl_write() calls continue the TLS stream transparently.
  *
@@ -145,8 +142,8 @@ int op_ssl_adopt_exported_outgoing(op_fde_t *F, const uint8_t *buf, size_t len);
  * wire format, but passed as a C string here); context / context_len are the
  * optional per-association context (pass NULL / 0 for the no-context case).
  *
- * Returns 1 on success, 0 on failure (no SSL session, wolfSSL built without
- * HAVE_KEYING_MATERIAL, or the derivation itself failed).
+ * Returns 1 on success, 0 on failure (no SSL session or the derivation
+ * itself failed).
  *
  * Primary use: SASL EXTERNAL with tls-exporter channel binding (RFC 9266).
  * The label "EXPORTER-Channel-Binding" with no context produces a 32-byte

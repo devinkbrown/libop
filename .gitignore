@@ -1,0 +1,9 @@
+builddir/
+build/
+*.o
+*.so
+*.a
+*.dylib
+c23_detailed_test
+c23_test
+crypto_c23_fixed

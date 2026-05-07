@@ -786,13 +786,11 @@ static void op_accept_tryaccept(op_fde_t *F, void *data __attribute__((unused)))
 			if (!F->accept->precb(new_F, (struct sockaddr *)&st, addrlen, F->accept->data))	/* pre-callback decided to drop it */
 				continue;
 		}
-#if HAVE_WOLFSSL
 		if (F->type & OP_FD_SSL)
 		{
 			op_ssl_accept_setup(F, new_F, (struct sockaddr *)&st, addrlen, false);
 		}
 		else
-#endif /* HAVE_WOLFSSL */
 		{
 			F->accept->callback(new_F, OP_OK, (struct sockaddr *)&st, addrlen,
 					    F->accept->data);
@@ -1500,12 +1498,10 @@ op_close(op_fde_t *F)
 	if (F->connect) { op_bh_free(conn_heap,   F->connect); F->connect = NULL; }
 	op_free(F->desc);
 	F->desc = NULL;
-#if HAVE_WOLFSSL
 	if (type & OP_FD_SSL)
 	{
 		op_ssl_shutdown(F);
 	}
-#endif /* HAVE_WOLFSSL */
 	if (type & OP_FD_WEBSOCKET)
 	{
 		op_ws_shutdown(F);
@@ -1617,12 +1613,10 @@ op_read(op_fde_t *F, void *buf, size_t count)
 	{
 		return op_ws_read(F, buf, count);
 	}
-#if HAVE_WOLFSSL
 	if (F->type & OP_FD_SSL)
 	{
 		return op_ssl_read(F, buf, count);
 	}
-#endif
 	if (F->type & OP_FD_SOCKET)
 	{
 		ret = recv(F->fd, buf, count, 0);
@@ -1652,10 +1646,8 @@ op_pending(op_fde_t *F)
 {
 	if (F == NULL)
 		return 0;
-#if HAVE_WOLFSSL
 	if (F->type & OP_FD_SSL)
 		return op_ssl_pending(F);
-#endif
 	return 0;
 }
 
@@ -1743,12 +1735,10 @@ op_write(op_fde_t *F, const void *buf, size_t count)
 	{
 		return op_ws_write(F, buf, count);
 	}
-#if HAVE_WOLFSSL
 	if (F->type & OP_FD_SSL)
 	{
 		return op_ssl_write(F, buf, count);
 	}
-#endif
 	if (F->type & OP_FD_SOCKET)
 	{
 		int flags = MSG_NOSIGNAL;
@@ -1765,7 +1755,7 @@ op_write(op_fde_t *F, const void *buf, size_t count)
 
 /* op_fake_writev — sequential per-iovec fallback for op_writev.
  * Needed whenever we cannot use writev() directly: no system writev (Windows /
- * old platforms), SSL (wolfSSL context needed per-call), and WebSocket
+ * old platforms), SSL (TLS context needed per-call), and WebSocket
  * (RFC 6455 framing must be applied per-message via op_write).  Define it
  * unconditionally so all builds have the symbol; the compiler will dead-strip
  * it where unused. */
@@ -1820,12 +1810,10 @@ op_writev(op_fde_t *F, struct op_iovec * vector, int count)
 	{
 		return op_fake_writev(F, vector, count);
 	}
-#if HAVE_WOLFSSL
 	if (F->type & OP_FD_SSL)
 	{
 		return op_fake_writev(F, vector, count);
 	}
-#endif /* HAVE_WOLFSSL */
 #ifdef HAVE_SENDMSG
 	if (F->type & OP_FD_SOCKET)
 	{

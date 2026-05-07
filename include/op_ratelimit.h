@@ -43,6 +43,7 @@
 #define LIBOP_RATELIMIT_H
 
 #include <stdint.h>
+#include <sys/time.h>
 
 /* ---- type ---------------------------------------------------------------- */
 

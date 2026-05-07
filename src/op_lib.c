@@ -334,7 +334,7 @@ op_set_time(void)
  * op_lib_version — human-readable library version string.
  *
  * Format: "<product> <version> — <ssl_info>"
- * Example: "ophion 1.71 — wolfssl 5.7.0"
+ * Example: "ophion 1.71 — opssl 1.0.0"
  * ---------------------------------------------------------------------- */
 const char *
 op_lib_version(void)

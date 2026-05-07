@@ -38,11 +38,10 @@
 
 #mesondefine HAVE_LIBURING
 
-#mesondefine HAVE_WOLFSSL
-#mesondefine HAVE_WOLFSSL_KTLS
+#mesondefine HAVE_OPSSL
 #mesondefine HAVE_KERNEL_TLS
 #mesondefine HAVE_KTLS_CHACHA20
-#mesondefine HAVE_WOLFSSL_SESSION_EXPORT
+#mesondefine HAVE_OPSSL_SESSION_EXPORT
 #mesondefine HAVE_ZLIB
 
 /* Build identity — meson project_name() and project_version(). */

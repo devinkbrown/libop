@@ -117,7 +117,7 @@ struct _fde
 	struct acceptdata *accept;
 	void *ssl;
 	void *ws;
-	bool ktls;         /* true: kernel TLS active; I/O bypasses wolfSSL */
+	bool ktls;         /* true: kernel TLS active; I/O bypasses opssl */
 	bool tls_outgoing; /* true: TLS was initiated outgoing (client side) */
 	unsigned int handshake_count;
 	uint64_t ssl_errno;  /* SSL error code; uint64_t for portability (matches ERR_get_error size) */

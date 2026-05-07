@@ -529,7 +529,7 @@ ws_parse_frames(op_fde_t *F, ws_state_t *ws)
  *
  * WebSocket connections may run over plain TCP (ws://, port 8082) or over
  * TLS (wss://, port 8080).  For TLS fds the WS layer must go through the
- * wolfSSL read/write API; raw recv/send would see encrypted bytes.
+ * TLS read/write API; raw recv/send would see encrypted bytes.
  *
  * ws_fd_recv: wraps op_ssl_read() on TLS fds, recv() on plain fds.
  *   Returns > 0 on success, 0 on EOF, < 0 on error/would-block.

@@ -247,11 +247,7 @@ op_rawbuf_flush(rawbuf_head_t *rb, op_fde_t *F)
 	/* Write directly through the SSL layer, bypassing any higher-level
 	 * protocol wrapping (e.g. WebSocket).  op_write() would re-enter
 	 * op_ws_write() for WebSocket fds, causing infinite recursion. */
-#if HAVE_WOLFSSL
 	retval = op_ssl_write(F, buf->data + rb->written, buf->len - rb->written);
-#else
-	retval = op_write(F, buf->data + rb->written, buf->len - rb->written);
-#endif
 	if (retval <= 0)
 		return retval;
 

@@ -1,4 +1,4 @@
-libop_lib = shared_library('op',
+_libop_src = files(
   'unix.c',
   'iocp.c',
   'crypt.c',
@@ -7,7 +7,6 @@ libop_lib = shared_library('op',
   'simd_scan.c',
   'balloc.c',
   'commio.c',
-  have_ssl ? 'wolfssl.c' : 'wolfssl_nossl.c',
   'websocket.c',
   'sha1.c',
   'event.c',
@@ -52,7 +51,17 @@ libop_lib = shared_library('op',
   'thread_pool.c',
   'lock_debug.c',
   'version.c',
-  dependencies: [librt_dep, have_ssl ? wolfssl_dep : [], liburing_dep, win32_socket_dep,
+)
+
+if opssl_dep.found()
+  _libop_src += files('opssl_backend.c')
+else
+  _libop_src += files('ssl_stubs.c')
+endif
+
+libop_lib = shared_library('op',
+  _libop_src,
+  dependencies: [librt_dep, opssl_dep, liburing_dep, win32_socket_dep,
                  meson.get_compiler('c').find_library('m', required: true),
                  dependency('threads')],
   install: true,

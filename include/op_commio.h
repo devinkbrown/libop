@@ -118,7 +118,7 @@ void op_close_pending_fds(void);
 /* Digest of SubjectPublicKeyInfo (RFC 5280), used by DANE (RFC 6698) */
 #define OP_SSL_CERTFP_METH_SPKI_SHA256	0x1001
 #define OP_SSL_CERTFP_METH_SPKI_SHA512	0x1002
-/* SHA-3 variants (WOLFSSL_SHA3 required) */
+/* SHA-3 variants */
 #define OP_SSL_CERTFP_METH_CERT_SHA3_256	0x0003
 #define OP_SSL_CERTFP_METH_CERT_SHA3_512	0x0004
 #define OP_SSL_CERTFP_METH_SPKI_SHA3_256	0x1003

@@ -196,27 +196,26 @@ communicate with the parent over a socket pair.  Used by the authentication
 daemon (`authd`) and the ban-check daemon (`bandb`).
 
 TLS and WebSocket handling are **not** helper processes — both run in-process
-via `libop/wolfssl.c` and `libop/websocket.c` respectively.  The former
+via `libop/opssl_backend.c` and `libop/websocket.c` respectively.  The former
 external `ssld` and `wsockd` subprocesses were retired.
 
 The DNS resolver is **not** a helper process — it runs entirely in-process
 inside the ircd (`ircd/res.c`) using a single UDP socket registered with the
 libop event loop via `op_socket` / `op_setselect` / `op_event_add`.
 
-## TLS (wolfSSL backend)
+## TLS (opssl backend)
 
-TLS is provided exclusively by wolfSSL via `libop/src/wolfssl.c`.  The file is
-compiled only when `HAVE_WOLFSSL` is defined (meson `-Dssl=enabled` or
-`-Dssl=auto` with wolfSSL present); otherwise `wolfssl_nossl.c` provides
-no-op stubs so non-TLS builds link cleanly.
+TLS is provided by opssl — ophion's own TLS library — via
+`libop/src/opssl_backend.c`.  opssl has no external dependencies and is always
+compiled in; there is no no-SSL build path.
 
 ### Key public API (`commio-ssl.h`)
 
 | Function | Description |
 |----------|-------------|
-| `op_init_ssl()` | Initialise the wolfSSL library.  Must be called once at startup. |
+| `op_init_ssl()` | Initialise the opssl library.  Must be called once at startup. |
 | `op_setup_ssl_server(cert, key, dh, ciphers, verify)` | Load server certificate, private key, DH parameters, and cipher list into the global TLS context.  Safe to call again on `REHASH`. |
-| `op_setup_ssl_server_sni(hostname, cert, key, dh, ciphers, verify)` | Register a per-hostname TLS context for SNI-based certificate selection.  Up to 16 entries. |
+| `op_setup_ssl_server_sni(hostname, cert, key, dh, ciphers, verify)` | Register a per-hostname TLS context for SNI-based certificate selection.  Up to 64 entries. |
 | `op_ssl_listen(F, backlog, defer_accept)` | Mark a socket as a TLS listen socket and call `op_listen`. |
 | `op_ssl_accept_setup(srv_F, cli_F, st, addrlen)` | Begin a TLS server handshake on a newly accepted client FD. |
 | `op_ssl_start_accepted(F, cb, data, timeout)` | Begin a TLS server handshake on a socket whose TCP accept was handled externally. |
@@ -225,39 +224,33 @@ no-op stubs so non-TLS builds link cleanly.
 | `op_ssl_read(F, buf, count)` | Read plaintext from a TLS session. |
 | `op_ssl_write(F, buf, count)` | Write plaintext to a TLS session. |
 | `op_ssl_shutdown(F)` | Send `close_notify` and free the TLS session. |
-| `op_ssl_is_ktls(F)` | Returns `true` if the connection has been offloaded to Linux kernel TLS (kTLS) or marked for close_notify suppression after a wolfSSL session export. |
-| `op_ssl_export(F, buf, buflen)` | Export the full wolfSSL TLS session state (keys, IVs, sequence numbers, cipher suite) into `buf`.  Returns bytes written, or -1 on error.  Requires `HAVE_WOLFSSL_SESSION_EXPORT`. |
-| `op_ssl_adopt_exported(F, buf, len)` | Reconstruct a live wolfSSL session on `F` from a blob produced by `op_ssl_export`.  Sets `F->ssl` and `F->type |= OP_FD_SSL`.  Returns 0 on success, -1 on error.  Requires `HAVE_WOLFSSL_SESSION_EXPORT`. |
-| `op_get_ssl_certfp(F, buf, method)` | Compute a TLS client certificate fingerprint (SHA-1/256/512 of the cert DER or SPKI). |
+| `op_ssl_is_ktls(F)` | Returns `true` if the connection has been offloaded to Linux kernel TLS (kTLS). |
+| `op_ssl_export(F, buf, buflen)` | Export the TLS session state into `buf`.  Returns bytes written, or -1 on error. |
+| `op_ssl_adopt_exported(F, buf, len)` | Reconstruct a TLS session on `F` from a blob produced by `op_ssl_export`.  Returns 0 on success, -1 on error. |
+| `op_get_ssl_certfp(F, buf, method)` | Compute a TLS client certificate fingerprint (SHA-1/256/512, SHA-3, SPKI variants). |
 
 ### SNI (Server Name Indication)
 
-`op_setup_ssl_server_sni()` adds entries to a fixed table (`SNI_CTX_MAX = 16`).
-During each TLS handshake the wolfSSL SNI callback fires, looks up the client's
-requested hostname, and switches the WOLFSSL session to the matching per-hostname
-CTX before the handshake completes.  Each CTX holds exactly one reference; the
-reference is transferred (old released, new acquired) when the SNI callback
-switches CTXs, and released again in `op_ssl_shutdown()`.
+`op_setup_ssl_server_sni()` adds entries to a fixed table (`SNI_CTX_MAX = 64`).
+During each TLS handshake the SNI callback looks up the client's requested
+hostname and switches the session to the matching per-hostname context before
+the handshake completes.
 
 ### TLS Live Migration (/UPGRADE)
 
 Ophion supports transferring established TLS client connections across a binary
-`/UPGRADE` without disconnecting the client.  Three paths are tried in order of
+`/UPGRADE` without disconnecting the client.  Two paths are tried in order of
 preference:
 
-#### 1. Kernel TLS (kTLS) — `HAVE_WOLFSSL_KTLS` / `HAVE_KERNEL_TLS`
+#### 1. Kernel TLS (kTLS) — `HAVE_KERNEL_TLS`
 
 After a successful TLS handshake using an AEAD cipher (AES-128-GCM,
 AES-256-GCM, or ChaCha20-Poly1305), ophion can promote the connection to Linux
-kernel TLS using wolfSSL's key-extraction APIs.  Two sub-paths:
-
-- **`HAVE_WOLFSSL_KTLS`** — wolfSSL was built with native kTLS; it calls
-  `setsockopt(SOL_TLS)` internally and manages I/O bypass.
-- **`HAVE_KERNEL_TLS`** — ophion extracts keys with
-  `wolfSSL_GetClient/ServerWriteKey/IV` and `wolfSSL_GetSequenceNumber`,
-  calls `setsockopt(SOL_TCP, TCP_ULP, "tls")` and then
-  `setsockopt(SOL_TLS, TLS_TX/RX)` itself.  `op_ssl_read`/`op_ssl_write`
-  then bypass wolfSSL and call `recvmsg`/`send` directly.
+kernel TLS.  The backend extracts keys via `opssl_conn_get_write_key()` /
+`opssl_conn_get_read_key()` / `opssl_conn_get_write_iv()` /
+`opssl_conn_get_read_iv()`, calls `setsockopt(SOL_TCP, TCP_ULP, "tls")` and
+then `setsockopt(SOL_TLS, TLS_TX/RX)`.  `op_ssl_read`/`op_ssl_write` then
+bypass opssl and call `recvmsg`/`send` directly.
 
 When kTLS is active, `op_ssl_is_ktls(F)` returns `true` and the socket FD is
 transferred via `SCM_RIGHTS`; the kernel continues handling all crypto in the
@@ -272,51 +265,35 @@ Prerequisite: `sudo modprobe tls` (or `CONFIG_TLS=y` in the kernel build).
 
 Log tag after each handshake: `[kTLS]`.
 
-#### 2. wolfSSL Session Export — `HAVE_WOLFSSL_SESSION_EXPORT`
+#### 2. Graceful reconnect (fallback)
 
-When the `tls` kernel module is unavailable (or kTLS is not compiled in),
-ophion can instead serialize the entire wolfSSL TLS session — keys, IVs,
-sequence numbers, and cipher suite — using `wolfSSL_tls_export()` and transfer
-the blob alongside the socket FD via `SCM_RIGHTS`.  The new binary calls
-`op_ssl_adopt_exported()` / `wolfSSL_tls_import()` to reconstruct a live
-wolfSSL context on the transferred FD.  The client sees no disconnect and no
-re-handshake.  **No kernel module is required.**
-
-Functions: `op_ssl_export(F, buf, buflen)` and `op_ssl_adopt_exported(F, buf, len)`.
-
-After a successful export, `op_fde_mark_ktls(F)` is called to suppress
-`close_notify` in `op_ssl_shutdown` before the FD is handed off.
-
-Prerequisite: wolfSSL built with `--enable-session-export`
-(`WOLFSSL_SESSION_EXPORT`).
-
-Log tag after each handshake: `[exportable]`.
-
-#### 3. Graceful reconnect (fallback)
-
-When neither kTLS nor session export is available, TLS clients receive a
-`close_notify` and must reconnect within `MIGRATE_PENDING_TTL` seconds
-(default 30 s) to restore channels, account, and modes silently.
+When kTLS is unavailable, TLS clients receive a `close_notify` and must
+reconnect within `MIGRATE_PENDING_TTL` seconds (default 30 s) to restore
+channels, account, and modes silently.
 
 ### DNS-over-TLS (DoT)
 
-Outgoing DNS queries use a dedicated client TLS context (`ssl_client_ctx`) built
-with `wolfSSLv23_client_method()` (TLS 1.3 preferred).  Per-session ALPN `"dot"`
-(RFC 7858 §3.2) is advertised via `wolfSSL_UseALPN()` — but **only** for
-connections that supply an SNI hostname (DoT resolver addresses).  S2S links
-reuse the same `ssl_client_ctx` without the ALPN advertisement.
+Outgoing DNS queries use a dedicated client TLS context (`ssl_client_ctx`)
+with TLS 1.3 preferred.  Per-session ALPN `"dot"` (RFC 7858 §3.2) is
+advertised — but **only** for connections that supply an SNI hostname (DoT
+resolver addresses).  S2S links reuse the same `ssl_client_ctx` without the
+ALPN advertisement.
 
-Post-handshake drain: after `wolfSSL_connect()` succeeds, a loop drains any
-buffered TLS records (NewSessionTicket, etc.) before the first DNS query is sent.
-The loop peeks the socket after each `NEED_READ` to determine whether more data
-is buffered, capping at 32 iterations.
+Post-handshake drain: after the TLS handshake succeeds, a loop drains any
+buffered TLS records (NewSessionTicket, etc.) before the first DNS query is
+sent.  The loop peeks the socket after each `NEED_READ` to determine whether
+more data is buffered, capping at 32 iterations.
 
-### wolfSSL build requirements
+### opssl crypto primitives
 
-wolfSSL must be compiled with:
-- `--enable-opensslall` (provides `OPENSSL_EXTRA`, required for X.509 functions)
-- `--enable-alpn` (required for DNS-over-TLS ALPN advertisement)
-- `--enable-sha512` (optional; required for SHA-512 certfp; checked at configure time)
+opssl provides all cryptographic primitives needed by ophion:
 
-The meson build system probes for each feature at configure time and emits a
-clear error if a required feature is missing.
+- **Hash**: SHA-1, SHA-256, SHA-384, SHA-512, SHA3-256, SHA3-512
+- **MAC**: HMAC-SHA-256/384/512
+- **KDF**: HKDF, PBKDF2
+- **AEAD**: AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305
+- **Key exchange**: X25519, P-256, P-384
+- **Signatures**: Ed25519, ECDSA (P-256/P-384), RSA (PKCS#1 v1.5, PSS)
+- **Post-quantum**: ML-KEM-768, ML-KEM-1024
+- **X.509**: DER parsing, certificate chain verification, fingerprinting
+- **Base64**: standard and URL-safe encode/decode
