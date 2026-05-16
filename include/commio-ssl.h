@@ -41,6 +41,9 @@ void op_ssl_start_connected(op_fde_t *F, CNCB * callback, void *data, int timeou
 void op_connect_tcp_ssl(op_fde_t *F, struct sockaddr *dest, struct sockaddr *clocal,
 			CNCB * callback, void *data, int timeout,
 			const char *sni_hostname);
+void op_connect_tcp_ssl_ex(op_fde_t *F, struct sockaddr *dest, struct sockaddr *clocal,
+			   CNCB * callback, void *data, int timeout,
+			   const char *sni_hostname, const char *alpn);
 void op_ssl_accept_setup(op_fde_t *F, op_fde_t *new_F, struct sockaddr *st, int addrlen, bool wsock);
 void op_ssl_shutdown(op_fde_t *F);
 ssize_t op_ssl_read(op_fde_t *F, void *buf, size_t count);

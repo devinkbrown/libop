@@ -192,6 +192,7 @@ op_sleep(unsigned int seconds, unsigned int useconds)
 			break;
 	}
 #else
+	(void)rem;
 	/* Last resort: select() with a timeout.  Signal interruption is
 	 * not retried here because select() does not return remaining time. */
 	struct timeval tv = { .tv_sec = seconds, .tv_usec = useconds };

@@ -944,14 +944,31 @@ op_read_timerfd(op_fde_t *restrict F, void *data)
 
 	if (retlen == 0 || (retlen < 0 && !op_ignore_errno(errno)))
 	{
-		op_lib_log("op_read_timerfd: timerfd[%s] closed on error: %s",
-		           event->name, strerror(errno));
+		event->comm_ptr = NULL;
+		if (errno == EBADF)
+			F->fd = -1;
 		op_close(F);
+		op_run_one_event(event);
 		return;
 	}
 
-	/* Re-arm read interest before dispatching (EPOLLONESHOT silenced it). */
-	op_setselect(F, OP_SELECT_READ, op_read_timerfd, event);
+	if (event->frequency != 0)
+	{
+		/* Recurring: re-arm so the timerfd fires again next interval. */
+		op_setselect(F, OP_SELECT_READ, op_read_timerfd, event);
+	}
+	else
+	{
+		/* One-shot: close the timerfd and detach it from the event BEFORE
+		 * running the callback.  The callback (e.g. dot_connect) may call
+		 * op_event_delete() which also tries to close the timerfd via
+		 * op_io_unsched_event(); by clearing comm_ptr first we guarantee
+		 * only one close path fires and eliminate the window where a
+		 * stale fde entry can collide with a newly created timerfd that
+		 * reuses the same kernel FD number. */
+		event->comm_ptr = NULL;
+		op_close(F);
+	}
 	op_run_one_event(event);
 }
 
@@ -993,10 +1010,26 @@ op_epoll_sched_event_timerfd(struct ev_entry *restrict event, int when)
 	F = op_open(fd, OP_FD_UNKNOWN, buf);
 	if (__builtin_expect(F == NULL, 0))
 	{
-		op_lib_log("op_epoll_sched_event_timerfd: op_open failed for %s",
-		           event->name);
-		close(fd);
-		return 0;
+		/* Recovery: if a stale fde entry blocks the open, force-close it
+		 * and retry once.  This prevents a leaked timerfd fde from causing
+		 * a permanent spin loop (timerfd_create returns the same FD, op_open
+		 * rejects it, close frees it, repeat). */
+		op_fde_t *stale = op_find_fd(fd);
+		if (stale != NULL && IsFDOpen(stale))
+		{
+			op_lib_log("op_epoll_sched_event_timerfd: recycling stale "
+			           "fde %d (%s) for %s", fd,
+			           stale->desc ? stale->desc : "?", event->name);
+			op_close(stale);
+			F = op_open(fd, OP_FD_UNKNOWN, buf);
+		}
+		if (__builtin_expect(F == NULL, 0))
+		{
+			op_lib_log("op_epoll_sched_event_timerfd: op_open failed "
+			           "for %s", event->name);
+			close(fd);
+			return 0;
+		}
 	}
 
 	op_set_nb(F);

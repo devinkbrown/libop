@@ -91,7 +91,6 @@ typedef struct op_bh_shmem_hdr
 /* Header embedded at the very start of every mmap'd slab. */
 typedef struct op_bh_slab
 {
-	op_dlink_node node;     /* links into op_bh.block_list; .data == this */
 	size_t        map_size; /* total bytes mmap'd (for munmap) */
 	int           shmem_fd; /* -1 for private slabs; memfd for shared ones */
 } op_bh_slab_t;
@@ -99,13 +98,12 @@ typedef struct op_bh_slab
 /* Private definition of op_bh (opaque to callers via op_balloc.h). */
 struct op_bh
 {
-	op_dlink_node   hlist;          /* node in the global heap_lists registry */
 	size_t          elemSize;       /* requested element size (for reporting) */
 	size_t          elem_stride;    /* elemSize rounded up to pointer alignment */
 	size_t          elemsPerBlock;  /* elements per slab */
 	size_t          data_off;       /* byte offset from slab start to first element */
 	void           *free_head;      /* head of the intrusive free list */
-	op_dlink_list   block_list;     /* list of op_bh_slab_t* */
+	op_vec_t        block_list;     /* vec of op_bh_slab_t* */
 	size_t          nfree;          /* total free elements across all slabs */
 	size_t          nused;          /* total allocated elements */
 	char           *desc;
@@ -121,7 +119,7 @@ struct op_bh
 	_Atomic(uint32_t) generation;
 };
 
-static op_dlink_list *heap_lists;
+static op_vec_t *heap_lists;
 static long           op_page_size;
 
 static void _op_bh_fail(const char *reason, const char *file, int line)
@@ -138,7 +136,8 @@ _op_bh_fail(const char *reason, const char *file, int line)
 void
 op_init_bh(void)
 {
-	heap_lists   = op_malloc(sizeof(op_dlink_list));
+	heap_lists   = op_malloc(sizeof(op_vec_t));
+	op_vec_init(heap_lists, 0);
 	op_page_size = sysconf(_SC_PAGESIZE);
 	if (op_page_size <= 0)
 		op_page_size = 4096;
@@ -161,7 +160,7 @@ op_bh_grow(op_bh *bh)
 
 	op_bh_slab_t *slab = mem;
 	slab->map_size = map_size;
-	op_dlinkAdd(slab, &slab->node, &bh->block_list);
+	op_vec_push(&bh->block_list, slab);
 
 	/* Push in reverse order so the first alloc returns the lowest-address elem. */
 	char *base = (char *)mem + bh->data_off;
@@ -194,6 +193,7 @@ op_bh_alloc_struct(size_t elemsize, size_t elemsperblock, const char *desc)
 	bh->desc          = (desc != NULL) ? op_strdup(desc) : NULL;
 	bh->shmem_fd      = -1;
 	bh->shmem_size    = 0;
+	op_vec_init(&bh->block_list, 4);
 	atomic_init(&bh->generation, 0);
 	if (pthread_mutex_init(&bh->lock, NULL) != 0)
 		op_bh_fail("op_bh_alloc_struct: pthread_mutex_init failed");
@@ -204,7 +204,7 @@ op_bh *
 op_bh_create(size_t elemsize, size_t elemsperblock, const char *desc)
 {
 	op_bh *bh = op_bh_alloc_struct(elemsize, elemsperblock, desc);
-	op_dlinkAdd(bh, &bh->hlist, heap_lists);
+	op_vec_push(heap_lists, bh);
 	op_bh_grow(bh);
 	return bh;
 }
@@ -290,7 +290,7 @@ op_bh_create_shared(size_t elemsize, size_t elemsperblock, const char *desc)
 	op_bh_slab_t *slab = slab_mem;
 	slab->map_size = slab_size;
 	slab->shmem_fd = fd;
-	op_dlinkAdd(slab, &slab->node, &bh->block_list);
+	op_vec_push(&bh->block_list, slab);
 
 	char *base = (char *)slab_mem + bh->data_off;
 	for (size_t i = bh->elemsPerBlock; i-- > 0; )
@@ -304,7 +304,7 @@ op_bh_create_shared(size_t elemsize, size_t elemsperblock, const char *desc)
 	bh->shmem_fd   = fd;
 	bh->shmem_size = total;
 
-	op_dlinkAdd(bh, &bh->hlist, heap_lists);
+	op_vec_push(heap_lists, bh);
 	return bh;
 #endif /* HAVE_MEMFD */
 }
@@ -372,7 +372,7 @@ op_bh_attach_shmem(int fd, size_t size, const char *desc)
 
 	op_bh_slab_t *slab = slab_mem;
 	slab->shmem_fd = fd;
-	op_dlinkAdd(slab, &slab->node, &bh->block_list);
+	op_vec_push(&bh->block_list, slab);
 
 	/* Reconstruct free-list by scanning: any slot whose first pointer-word
 	 * is zero is considered free (works because op_bh_alloc memsets to 0). */
@@ -396,7 +396,7 @@ op_bh_attach_shmem(int fd, size_t size, const char *desc)
 		}
 	}
 
-	op_dlinkAdd(bh, &bh->hlist, heap_lists);
+	op_vec_push(heap_lists, bh);
 	return bh;
 #endif /* HAVE_MEMFD */
 }
@@ -658,18 +658,17 @@ op_bh_destroy(op_bh *bh)
 		}
 	}
 
-	op_dlinkDelete(&bh->hlist, heap_lists);
+	op_vec_remove_ptr(heap_lists, bh);
 
-	/* munmap each slab; use op_dlinkDelete (not Destroy) since the node is
-	 * embedded inside the slab region that we're about to unmap. */
-	while (bh->block_list.head != NULL)
+	/* munmap each slab; reverse-index so remove_fast stays O(1). */
+	for (size_t _si = bh->block_list.size; _si-- > 0; )
 	{
-		op_dlink_node *node     = bh->block_list.head;
-		op_bh_slab_t  *slab     = node->data;
-		size_t         map_size = slab->map_size;
-		op_dlinkDelete(node, &bh->block_list);
+		op_bh_slab_t *slab     = op_vec_get(&bh->block_list, _si);
+		size_t        map_size = slab->map_size;
+		op_vec_remove_fast(&bh->block_list, _si);
 		munmap(slab, map_size);
 	}
+	op_vec_fini(&bh->block_list, NULL, NULL);
 
 	pthread_mutex_destroy(&bh->lock);
 	op_free(bh->desc);
@@ -698,14 +697,14 @@ op_bh_usage(op_bh *bh, size_t *bused, size_t *bfree, size_t *bmemusage,
 void
 op_bh_usage_all(op_bh_usage_cb *cb, void *data)
 {
-	op_dlink_node *ptr;
+	size_t _i; void *_e;
 
 	if (cb == NULL)
 		return;
 
-	OP_DLINK_FOREACH(ptr, heap_lists->head)
+	OP_VEC_FOREACH(heap_lists, _i, _e)
 	{
-		op_bh  *bh        = ptr->data;
+		op_bh  *bh        = _e;
 		size_t  heapalloc = (bh->nused + bh->nfree) * bh->elemSize;
 		cb(bh->nused, bh->nfree,
 		   bh->nused * bh->elemSize,
@@ -718,12 +717,12 @@ op_bh_usage_all(op_bh_usage_cb *cb, void *data)
 void
 op_bh_total_usage(size_t *total_alloc, size_t *total_used)
 {
-	op_dlink_node *ptr;
-	size_t         talloc = 0, tused = 0;
+	size_t _i; void *_e;
+	size_t talloc = 0, tused = 0;
 
-	OP_DLINK_FOREACH(ptr, heap_lists->head)
+	OP_VEC_FOREACH(heap_lists, _i, _e)
 	{
-		op_bh *bh  = ptr->data;
+		op_bh *bh  = _e;
 		talloc    += (bh->nused + bh->nfree) * bh->elemSize;
 		tused     += bh->nused * bh->elemSize;
 	}

@@ -836,7 +836,7 @@ worker_entry(void *arg)
 
 		{
 			struct pollfd pf = { .fd = ctx->wake.rfd, .events = POLLIN };
-			poll(&pf, 1, 1 /* ms */);
+			poll(&pf, 1, 100 /* ms */);
 		}
 		wake_fd_drain(&ctx->wake);
 	}

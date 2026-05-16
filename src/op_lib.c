@@ -707,7 +707,7 @@ op_base64url_encode(const unsigned char *src, size_t len)
 unsigned char *
 op_base64url_decode(const unsigned char *src, size_t len, size_t *out_len)
 {
-	if (len == SIZE_MAX)
+	if (len >= SIZE_MAX - 4)
 		return NULL;
 
 	/* Copy and translate to standard base64. */

@@ -4,7 +4,7 @@
  * CSPRNG providing arc4random(3)-compatible API backed by the ChaCha20
  * stream cipher (D.J. Bernstein, public-domain design, RFC 8439).
  *
- * Copyright (C) 2024-2025 Ophion IRC Daemon contributors
+ * Copyright (C) 2024-2026 Ophion IRC Daemon contributors
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by

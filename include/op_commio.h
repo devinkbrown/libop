@@ -139,6 +139,7 @@ void op_settimeout(op_fde_t *, time_t, PF *, void *);
 void op_checktimeouts(void *);
 void op_connect_tcp(op_fde_t *, struct sockaddr *, struct sockaddr *, CNCB *, void *, int);
 void op_connect_tcp_ssl(op_fde_t *, struct sockaddr *, struct sockaddr *, CNCB *, void *, int, const char *);
+void op_connect_tcp_ssl_ex(op_fde_t *, struct sockaddr *, struct sockaddr *, CNCB *, void *, int, const char *, const char *);
 void op_connect_sctp(op_fde_t *, struct sockaddr_storage *connect_addrs, size_t connect_len, struct sockaddr_storage *bind_addrs, size_t bind_len, CNCB *, void *, int);
 int op_connect_sockaddr(const op_fde_t *, struct sockaddr *addr, int len);
 
@@ -217,6 +218,7 @@ void op_ssl_start_connected(op_fde_t *F, CNCB * callback, void *data, int timeou
 void    op_ws_start_accepted(op_fde_t *F, ACCB *cb, void *data, int timeout);
 ssize_t op_ws_read(op_fde_t *F, void *buf, size_t count);
 ssize_t op_ws_write(op_fde_t *F, const void *buf, size_t count);
+int     op_ws_pending(const op_fde_t *F);
 void    op_ws_shutdown(op_fde_t *F);
 int     op_fd_ws(const op_fde_t *F);
 void    op_ws_attach_transferred(op_fde_t *F);

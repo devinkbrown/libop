@@ -128,7 +128,7 @@ Privilege reduction and secure memory for daemon processes.  Full API in
 int op_seccomp_lockdown(void);
 ```
 
-Installs a BPF deny-list filter for helper daemons (ssld, wsockd, discordd,
+Installs a BPF deny-list filter for helper daemons (ssld, wsockd,
 authproc) that never spawn children.  Denies exec/fork/ptrace, eBPF, kexec,
 keyring, namespaces, perf_event_open, io_uring, SysV shm, module loading,
 chroot, I/O ports, personality (ASLR disable), vmsplice/splice/tee, mount,
@@ -291,9 +291,14 @@ opssl provides all cryptographic primitives needed by ophion:
 - **Hash**: SHA-1, SHA-256, SHA-384, SHA-512, SHA3-256, SHA3-512
 - **MAC**: HMAC-SHA-256/384/512
 - **KDF**: HKDF, PBKDF2
-- **AEAD**: AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305
-- **Key exchange**: X25519, P-256, P-384
+- **AEAD**: AES-128/256-GCM, ChaCha20-Poly1305, AES-128/256-CCM, AES-128/256-CCM_8, Camellia-128/256-GCM
+- **Block ciphers**: AES, Camellia
+- **Key exchange**: X25519, P-256, P-384, FFDHE-2048/3072/4096
 - **Signatures**: Ed25519, ECDSA (P-256/P-384), RSA (PKCS#1 v1.5, PSS)
 - **Post-quantum**: ML-KEM-768, ML-KEM-1024
-- **X.509**: DER parsing, certificate chain verification, fingerprinting
+- **X.509**: DER parsing, certificate chain verification, CRL, OCSP, fingerprinting
 - **Base64**: standard and URL-safe encode/decode
+
+## License
+
+GPL-2.0-or-later

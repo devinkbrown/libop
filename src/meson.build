@@ -51,6 +51,7 @@ _libop_src = files(
   'thread_pool.c',
   'lock_debug.c',
   'version.c',
+  'crdt.c',
 )
 
 if opssl_dep.found()
@@ -65,5 +66,6 @@ libop_lib = shared_library('op',
                  meson.get_compiler('c').find_library('m', required: true),
                  dependency('threads')],
   install: true,
+  install_rpath: get_option('prefix') / get_option('libdir'),
   include_directories: [libop_inc]
 )

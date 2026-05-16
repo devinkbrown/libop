@@ -36,11 +36,11 @@ struct op_htab
 	size_t           mask;    /* (capacity - 1); capacity is always power-of-2 */
 	size_t           count;   /* live entries                                   */
 	const char      *name;
-	op_dlink_node    node;    /* membership in the global htab_list             */
 };
 
 /* Global registry of all live op_htab instances, used by op_htab_stats_walk. */
-static op_dlink_list htab_list = { NULL, NULL, 0 };
+static op_vec_t htab_list;
+static bool htab_list_inited;
 
 /* ---- internal helpers ---------------------------------------------------- */
 
@@ -270,7 +270,8 @@ op_htab_create(const char *name,
 	ht->count   = 0;
 	ht->mask    = cap - 1;
 	ht->slots   = op_calloc(cap, sizeof(op_htab_slot_t));
-	op_dlinkAdd(ht, &ht->node, &htab_list);
+	if (!htab_list_inited) { op_vec_init(&htab_list, 16); htab_list_inited = true; }
+	op_vec_push(&htab_list, ht);
 	return ht;
 }
 
@@ -406,7 +407,7 @@ op_htab_destroy(op_htab *ht,
 				destroy_cb(ht->slots[i].key, ht->slots[i].val, ud);
 		}
 	}
-	op_dlinkDelete(&ht->node, &htab_list);
+	op_vec_remove_ptr(&htab_list, ht);
 	op_free(ht->slots);
 	op_free(ht);
 }
@@ -677,12 +678,12 @@ op_htab_merge(op_htab *dst, const op_htab *src,
 void
 op_htab_stats_walk(void (*cb)(const char *line, void *privdata), void *privdata)
 {
-	op_dlink_node *ptr;
+	size_t _i; void *_e;
 	char str[256];
 
-	OP_DLINK_FOREACH(ptr, htab_list.head)
+	OP_VEC_FOREACH(&htab_list, _i, _e)
 	{
-		const op_htab *ht = ptr->data;
+		const op_htab *ht = _e;
 		size_t cap  = ht->mask + 1;
 		size_t load = cap ? (ht->count * 100) / cap : 0;
 		snprintf(str, sizeof str,

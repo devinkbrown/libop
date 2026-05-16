@@ -3,7 +3,7 @@
  *  op_helper.h: Helper process management.
  *
  *  Copyright (C) 2006 Aaron Sethman <androsyn@ratbox.org>
- *  Copyright (C) 2025 ophion development team
+ *  Copyright (C) 2025-2026 ophion development team
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -66,5 +66,5 @@ void op_helper_write_flush(op_helper *helper);
 void op_helper_run(op_helper *helper);
 void op_helper_close(op_helper *helper);
 int op_helper_read(op_helper *helper, void *buf, size_t bufsize);
-void op_helper_loop(op_helper *helper, long delay) __attribute__((noreturn));
+OP_NORETURN void op_helper_loop(op_helper *helper, long delay);
 #endif

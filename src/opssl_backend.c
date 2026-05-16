@@ -31,7 +31,9 @@
 #include <commio-ssl.h>
 #include <opssl/opssl.h>
 
+#include <ctype.h>
 #include <sys/random.h>
+#include <unistd.h>
 
 #ifdef HAVE_KERNEL_TLS
 # include <linux/tls.h>
@@ -50,6 +52,49 @@ typedef enum
 
 static opssl_ctx_t *ssl_ctx        = NULL;
 static opssl_ctx_t *ssl_client_ctx = NULL;
+static opssl_ctx_t *ssl_dot_ctx    = NULL;
+
+static bool
+tls_hostname_valid(const char *hostname)
+{
+	if (hostname == NULL || *hostname == '\0')
+		return false;
+
+	size_t len = strlen(hostname);
+	if (len >= 256)
+		return false;
+
+	for (size_t i = 0; i < len; i++)
+	{
+		unsigned char c = (unsigned char)hostname[i];
+		if (c <= 0x20 || c >= 0x7f)
+			return false;
+		if (!(isalnum(c) || c == '-' || c == '.' || c == '_' || c == ':'))
+			return false;
+	}
+
+	return true;
+}
+
+static bool
+tls_alpn_valid(const char *alpn)
+{
+	if (alpn == NULL || *alpn == '\0')
+		return true;
+
+	size_t len = strlen(alpn);
+	if (len >= 32)
+		return false;
+
+	for (size_t i = 0; i < len; i++)
+	{
+		unsigned char c = (unsigned char)alpn[i];
+		if (c == '\0' || c > 0x7f)
+			return false;
+	}
+
+	return true;
+}
 
 /* -------------------------------------------------------------------------
  * SNI context table
@@ -84,11 +129,13 @@ struct ssl_connect
 	void *data;
 	int timeout;
 	char sni_hostname[256];
+	char alpn[32];
 };
 
 static void op_ssl_connect_realcb(op_fde_t *, int, struct ssl_connect *);
 static void op_ssl_accept_common(op_fde_t *, void *);
 static void op_ssl_connect_common(op_fde_t *, void *);
+static void op_ssl_flush_pending_write(op_fde_t *, void *);
 
 
 /*
@@ -112,28 +159,123 @@ build_client_ssl_ctx(void)
 		OPSSL_OPT_NO_RENEGOTIATION |
 		OPSSL_OPT_NO_COMPRESSION);
 
-	opssl_ctx_set_curves(ctx, "X25519:P-521:P-384:P-256");
+	if (!opssl_ctx_set_curves(ctx, "X25519:P-256:P-384"))
+		op_lib_log("%s: opssl_ctx_set_curves failed", __func__);
+
+	return ctx;
+}
+
+static bool
+load_dot_system_ca(opssl_ctx_t *ctx)
+{
+	static const char *const ca_files[] = {
+		"/etc/ssl/certs/ca-certificates.crt",
+		"/etc/ca-certificates/extracted/tls-ca-bundle.pem",
+		"/etc/pki/tls/certs/ca-bundle.crt",
+		"/etc/ssl/ca-bundle.pem",
+		"/etc/ssl/cert.pem",
+		"/usr/local/share/certs/ca-root-nss.crt",
+		NULL
+	};
+	static const char *const ca_dirs[] = {
+		"/etc/ssl/certs",
+		"/etc/ca-certificates/extracted",
+		"/etc/pki/ca-trust/extracted/pem",
+		NULL
+	};
+
+	if (opssl_ctx_load_default_verify_paths(ctx))
+		return true;
+
+	const char *env_file = getenv("SSL_CERT_FILE");
+	if (env_file != NULL && *env_file != '\0'
+	    && opssl_ctx_load_verify_locations(ctx, env_file, NULL))
+		return true;
+
+	const char *env_dir = getenv("SSL_CERT_DIR");
+	if (env_dir != NULL && *env_dir != '\0'
+	    && opssl_ctx_load_verify_locations(ctx, NULL, env_dir))
+		return true;
+
+	for (size_t i = 0; ca_files[i] != NULL; i++) {
+		if (access(ca_files[i], R_OK) == 0
+		    && opssl_ctx_load_verify_locations(ctx, ca_files[i], NULL))
+			return true;
+	}
+
+	for (size_t i = 0; ca_dirs[i] != NULL; i++) {
+		if (access(ca_dirs[i], R_OK) == 0
+		    && opssl_ctx_load_verify_locations(ctx, NULL, ca_dirs[i]))
+			return true;
+	}
+
+	return false;
+}
+
+static opssl_ctx_t *
+build_dot_ssl_ctx(void)
+{
+	opssl_ctx_t *ctx = opssl_ctx_new(OPSSL_TLS_1_3);
+	if (ctx == NULL)
+	{
+		op_lib_log("%s: opssl_ctx_new failed", __func__);
+		return NULL;
+	}
+
+	opssl_ctx_set_min_version(ctx, OPSSL_TLS_1_2);
+	opssl_ctx_set_options(ctx,
+		OPSSL_OPT_NO_RENEGOTIATION |
+		OPSSL_OPT_NO_COMPRESSION |
+		OPSSL_OPT_NO_TICKETS);
+
+	if (load_dot_system_ca(ctx))
+	{
+		opssl_ctx_set_verify(ctx, true, NULL, NULL);
+	}
+	else
+	{
+		op_lib_log("%s: could not load system CA bundle — "
+		           "refusing unverified DoT", __func__);
+		opssl_ctx_free(ctx);
+		return NULL;
+	}
+
+	if (!opssl_ctx_set_curves(ctx, "X25519:P-256:P-384"))
+		op_lib_log("%s: opssl_ctx_set_curves failed", __func__);
 
 	return ctx;
 }
 
 static int
 op_ssl_init_fd(op_fde_t *const F, const op_fd_tls_direction dir,
-               const char *const sni_hostname, const bool wsock)
+               const char *const sni_hostname, const bool wsock,
+               const char *const caller_alpn)
 {
 	opssl_ctx_t *use_ctx;
 
 	if (dir == OP_FD_TLS_DIRECTION_OUT)
 	{
-		if (ssl_client_ctx == NULL)
-			ssl_client_ctx = build_client_ssl_ctx();
+		bool is_dot = (caller_alpn && strcmp(caller_alpn, OPSSL_ALPN_DOT) == 0);
 
-		if (ssl_client_ctx == NULL)
+		if (is_dot)
 		{
-			op_lib_log("%s: could not create client TLS context", __func__);
+			if (ssl_dot_ctx == NULL)
+				ssl_dot_ctx = build_dot_ssl_ctx();
+			use_ctx = ssl_dot_ctx;
+		}
+		else
+		{
+			if (ssl_client_ctx == NULL)
+				ssl_client_ctx = build_client_ssl_ctx();
+			use_ctx = ssl_client_ctx;
+		}
+
+		if (use_ctx == NULL)
+		{
+			op_lib_log("%s: could not create %s TLS context", __func__,
+			           is_dot ? "DoT" : "client");
 			return -1;
 		}
-		use_ctx = ssl_client_ctx;
 	}
 	else
 	{
@@ -156,30 +298,55 @@ op_ssl_init_fd(op_fde_t *const F, const op_fd_tls_direction dir,
 		return -1;
 	}
 
+	/*
+	 * Browser WebSocket stacks do not reliably handle a TLS 1.3
+	 * CertificateRequest on wss:// listeners.  Keep optional client certs
+	 * enabled for normal IRC TLS so SASL EXTERNAL/certfp still work, but
+	 * suppress the request for WebSocket listeners before the handshake
+	 * state machine emits server flight 1.
+	 */
+	if (dir == OP_FD_TLS_DIRECTION_IN && wsock)
+		opssl_conn_request_client_cert(SSL_P(F), false);
+
 	F->tls_outgoing = (dir == OP_FD_TLS_DIRECTION_OUT);
 
 	if (sni_hostname && *sni_hostname)
+	{
+		if (!tls_hostname_valid(sni_hostname))
+		{
+			op_lib_log("%s: refusing invalid SNI hostname '%s'",
+			           __func__, sni_hostname);
+			opssl_conn_free(SSL_P(F));
+			F->ssl = NULL;
+			return -1;
+		}
 		opssl_conn_set_sni(SSL_P(F), sni_hostname);
+	}
 
 	if (dir == OP_FD_TLS_DIRECTION_OUT && sni_hostname && *sni_hostname)
 	{
-		const char *alpn[] = { OPSSL_ALPN_DOT };
+		const char *a = (caller_alpn && *caller_alpn) ? caller_alpn : OPSSL_ALPN_IRC;
+		if (!tls_alpn_valid(a))
+		{
+			op_lib_log("%s: refusing invalid ALPN '%s'", __func__, a);
+			opssl_conn_free(SSL_P(F));
+			F->ssl = NULL;
+			return -1;
+		}
+		const char *alpn[] = { a };
 		opssl_conn_set_alpn(SSL_P(F), alpn, 1);
 	}
 
 	if (dir == OP_FD_TLS_DIRECTION_IN)
 	{
-		if (!wsock)
-		{
+		if (wsock) {
+			const char *alpn_http[] = { OPSSL_ALPN_HTTP11 };
+			opssl_conn_set_alpn(SSL_P(F), alpn_http, 1);
+		} else {
 			const char *alpn[] = { OPSSL_ALPN_IRC };
 			opssl_conn_set_alpn(SSL_P(F), alpn, 1);
 		}
-		const char *alpn_http[] = { OPSSL_ALPN_HTTP11 };
-		opssl_conn_set_alpn(SSL_P(F), alpn_http, 1);
 	}
-
-	if (wsock && dir == OP_FD_TLS_DIRECTION_IN)
-		opssl_ctx_set_verify(use_ctx, false, NULL, NULL);
 
 	return 0;
 }
@@ -351,7 +518,6 @@ op_ssl_try_ktls(op_fde_t *const F)
 	case OPSSL_TLS_DHE_RSA_AES_128_GCM:
 		cipher_type = TLS_CIPHER_AES_GCM_128;
 		key_sz = 16; salt_sz = 4; iv_sz = 8;
-		if (ver == OPSSL_TLS_1_3) { salt_sz = 0; iv_sz = 12; }
 		break;
 	case OPSSL_TLS_AES_256_GCM_SHA384:
 	case OPSSL_TLS_ECDHE_RSA_AES_256_GCM:
@@ -359,7 +525,6 @@ op_ssl_try_ktls(op_fde_t *const F)
 	case OPSSL_TLS_DHE_RSA_AES_256_GCM:
 		cipher_type = TLS_CIPHER_AES_GCM_256;
 		key_sz = 32; salt_sz = 4; iv_sz = 8;
-		if (ver == OPSSL_TLS_1_3) { salt_sz = 0; iv_sz = 12; }
 		break;
 	case OPSSL_TLS_CHACHA20_POLY1305_SHA256:
 	case OPSSL_TLS_ECDHE_RSA_CHACHA20:
@@ -377,10 +542,10 @@ op_ssl_try_ktls(op_fde_t *const F)
 	size_t sk_len = sizeof srv_key, ck_len = sizeof cli_key;
 	size_t si_len = sizeof srv_iv, ci_len = sizeof cli_iv;
 
-	if (opssl_conn_get_write_key(conn, srv_key, &sk_len) != 0 ||
-	    opssl_conn_get_read_key(conn, cli_key, &ck_len) != 0 ||
-	    opssl_conn_get_write_iv(conn, srv_iv, &si_len) != 0 ||
-	    opssl_conn_get_read_iv(conn, cli_iv, &ci_len) != 0)
+	if (!opssl_conn_get_write_key(conn, srv_key, &sk_len) ||
+	    !opssl_conn_get_read_key(conn, cli_key, &ck_len) ||
+	    !opssl_conn_get_write_iv(conn, srv_iv, &si_len) ||
+	    !opssl_conn_get_read_iv(conn, cli_iv, &ci_len))
 		return 0;
 
 	uint64_t tx_seq = 0, rx_seq = 0;
@@ -415,6 +580,30 @@ op_ssl_try_ktls(op_fde_t *const F)
 #endif /* HAVE_KERNEL_TLS */
 
 static void
+op_ssl_flush_pending_write(op_fde_t *const F, void *const data __attribute__((unused)))
+{
+	if (F == NULL || F->ssl == NULL)
+		return;
+
+	opssl_result_t ret = opssl_conn_flush_write(SSL_P(F));
+	if (ret == OPSSL_OK)
+	{
+		op_setselect(F, OP_SELECT_WRITE, NULL, NULL);
+		return;
+	}
+
+	if (ret == OPSSL_WANT_WRITE)
+	{
+		op_setselect(F, OP_SELECT_WRITE, op_ssl_flush_pending_write, NULL);
+		return;
+	}
+
+	op_lib_log("%s: pending TLS write flush failed fd %d: %s",
+	           __func__, op_get_fd(F), opssl_conn_get_error_string(SSL_P(F)));
+	op_setselect(F, OP_SELECT_WRITE, NULL, NULL);
+}
+
+static void
 accept_teardown(op_fde_t *const F)
 {
 	op_settimeout(F, 0, NULL, NULL);
@@ -437,20 +626,56 @@ op_ssl_accept_common(op_fde_t *const F, void *const data __attribute__((unused))
 	slop_assert(F->accept->callback != NULL);
 	slop_assert(F->ssl != NULL);
 
-	opssl_result_t ret = opssl_accept(SSL_P(F));
+	opssl_result_t ret;
+
+	/*
+	 * TLS 1.3 client-auth handshakes can deliver several encrypted
+	 * handshake/application records in one socket-read wakeup.  If opssl
+	 * consumes one record and reports WANT_READ while another transition is
+	 * already buffered internally, simply re-arming an edge-triggered fd can
+	 * strand registration until the client sends more data.  A small bounded
+	 * retry drains those already-available transitions without spinning on an
+	 * actually empty socket.
+	 */
+	for (unsigned int tries = 0; tries < 4; tries++)
+	{
+		ret = opssl_accept(SSL_P(F));
+		if (ret != OPSSL_WANT_READ)
+			break;
+	}
 
 	if (ret == OPSSL_OK)
 	{
 		F->handshake_count++;
 
-#ifdef HAVE_KERNEL_TLS
-		int ktls_rc = op_ssl_try_ktls(F);
-
-		if (ktls_rc < 0)
+		/* Flush any buffered TLS flight bytes before IRC registration.
+		 * Starting the IRC layer while opssl still has pending encrypted
+		 * handshake bytes can strand the first CAP replies behind a later
+		 * client write, which appears as registration stalling. */
+		opssl_result_t flush_rc = opssl_conn_flush_write(SSL_P(F));
+		if (flush_rc == OPSSL_WANT_WRITE)
+		{
+			op_setselect(F, OP_SELECT_READ, NULL, NULL);
+			op_setselect(F, OP_SELECT_WRITE, op_ssl_accept_common, NULL);
+			return;
+		}
+		if (flush_rc != OPSSL_OK)
 		{
 			errno = EIO;
 			accept_teardown(F);
 			return;
+		}
+
+#ifdef HAVE_KERNEL_TLS
+		{
+			int ktls_rc = op_ssl_try_ktls(F);
+
+			if (ktls_rc < 0)
+			{
+				errno = EIO;
+				accept_teardown(F);
+				return;
+			}
 		}
 #endif
 
@@ -477,6 +702,9 @@ op_ssl_accept_common(op_fde_t *const F, void *const data __attribute__((unused))
 		return;
 	}
 
+	op_lib_log("op_ssl_accept_common: handshake failed (ret=%d err=%d: %s)",
+	           ret, opssl_conn_get_error(SSL_P(F)),
+	           opssl_conn_get_error_string(SSL_P(F)));
 	errno = EIO;
 	F->ssl_errno = (uint64_t) opssl_conn_get_error(SSL_P(F));
 	accept_teardown(F);
@@ -517,6 +745,9 @@ op_ssl_connect_common(op_fde_t *const F, void *const data)
 		return;
 	}
 
+	op_lib_log("op_ssl_connect_common: handshake failed fd %d (ret=%d err=%d: %s)",
+	           op_get_fd(F), ret, opssl_conn_get_error(SSL_P(F)),
+	           opssl_conn_get_error_string(SSL_P(F)));
 	errno = EIO;
 	F->ssl_errno = (uint64_t) opssl_conn_get_error(SSL_P(F));
 	op_settimeout(F, 0, NULL, NULL);
@@ -528,7 +759,10 @@ static ssize_t
 op_ssl_read_or_write(const int r_or_w, op_fde_t *const F, void *const rbuf, const void *const wbuf, const size_t count)
 {
 	ssize_t ret;
-	int saved_errno = errno;
+
+	/* opssl_read/write set errno=EAGAIN for WANT_READ/WANT_WRITE.
+	 * Clear beforehand so stale EAGAIN cannot mask real errors. */
+	errno = 0;
 
 	if (r_or_w == 0)
 		ret = opssl_read(SSL_P(F), rbuf, count);
@@ -537,36 +771,21 @@ op_ssl_read_or_write(const int r_or_w, op_fde_t *const F, void *const rbuf, cons
 
 	if (ret < 0)
 	{
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
+		{
+			opssl_result_t want = opssl_conn_get_last_want(SSL_P(F));
+			errno = EAGAIN;
+			return (want == OPSSL_WANT_WRITE) ? OP_RW_SSL_NEED_WRITE
+			                                  : OP_RW_SSL_NEED_READ;
+		}
+
 		opssl_err_t err = opssl_conn_get_error(SSL_P(F));
-		int is_eagain = (saved_errno == EAGAIN  || saved_errno == EWOULDBLOCK
-		              || errno       == EAGAIN  || errno       == EWOULDBLOCK);
-		ssize_t need_rw = (r_or_w == 0) ? OP_RW_SSL_NEED_READ
-		                                 : OP_RW_SSL_NEED_WRITE;
-
-		/* opssl_read/write return negative for error conditions.
-		 * Map the error code from the connection state. */
-		(void)err;
-
-		if (is_eagain)
-		{
-			errno = EAGAIN;
-			return need_rw;
-		}
-
 		F->ssl_errno = (uint64_t)(unsigned int)err;
-		if (err > 0)
-		{
-			errno = EIO;
-			return OP_RW_SSL_ERROR;
-		}
-
-		if (is_eagain)
-		{
-			errno = EAGAIN;
-			return need_rw;
-		}
-		errno = saved_errno;
-		return OP_RW_IO_ERROR;
+		op_lib_log("opssl %s fd %d: ret=%zd ssl_error=%u errno=%d",
+		           r_or_w ? "write" : "read",
+		           op_get_fd(F), ret, (unsigned)err, errno);
+		errno = EIO;
+		return OP_RW_SSL_ERROR;
 	}
 	return ret;
 }
@@ -620,7 +839,7 @@ make_certfp(opssl_x509_t *const cert, uint8_t certfp[const OP_SSL_CERTFP_LEN], c
 	}
 
 	size_t fp_len = expected_len;
-	if (opssl_x509_fingerprint(cert, fp_method, certfp, &fp_len) != 0)
+	if (!opssl_x509_fingerprint(cert, fp_method, certfp, &fp_len))
 		return 0;
 
 	return (int)fp_len;
@@ -638,24 +857,29 @@ op_ssl_shutdown(op_fde_t *const F)
 	if (F == NULL || F->ssl == NULL)
 		return;
 
-	if (!F->ktls)
-		opssl_shutdown(SSL_P(F));
+	if (!F->ktls) {
+		opssl_result_t r = opssl_shutdown(SSL_P(F));
+		(void)r; /* best-effort: we free regardless */
+	}
 
 	opssl_conn_free(SSL_P(F));
 	F->ssl  = NULL;
 	F->ktls = false;
+	F->tls_outgoing = false;
+	F->ssl_errno = 0;
 }
 
 int
 op_init_ssl(void)
 {
-	if (opssl_init() != 0)
+	if (!opssl_init())
 	{
 		op_lib_log("%s: opssl_init failed", __func__);
 		return 0;
 	}
 
-	op_lib_log("%s: opssl backend initialised", __func__);
+	op_lib_log("%s: opssl backend initialised (%s)", __func__,
+	           opssl_version_string());
 	return 1;
 }
 
@@ -688,15 +912,41 @@ op_fde_mark_ktls(op_fde_t *const F)
 int
 op_ssl_export(op_fde_t *const F, uint8_t *const buf, const size_t buflen)
 {
-	(void)F; (void)buf; (void)buflen;
-	return -1;
+	if (F == NULL || F->ssl == NULL || buf == NULL)
+	{
+		errno = EINVAL;
+		return -1;
+	}
+	return opssl_conn_export(SSL_P(F), buf, buflen);
 }
 
 int
 op_ssl_adopt_exported(op_fde_t *const F, const uint8_t *const buf, const size_t len)
 {
-	(void)F; (void)buf; (void)len;
-	return -1;
+	if (F == NULL || buf == NULL)
+	{
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (F->ssl == NULL)
+	{
+		opssl_ctx_t *ctx = ssl_ctx;
+		if (ctx == NULL)
+		{
+			errno = ENOTSUP;
+			return -1;
+		}
+		F->ssl = opssl_conn_new(ctx, op_get_fd(F), OPSSL_DIR_INBOUND);
+		if (F->ssl == NULL)
+		{
+			errno = ENOMEM;
+			return -1;
+		}
+		F->type |= OP_FD_SSL;
+	}
+
+	return opssl_conn_import(SSL_P(F), buf, len);
 }
 
 bool
@@ -709,8 +959,31 @@ int
 op_ssl_adopt_exported_outgoing(op_fde_t *const F, const uint8_t *const buf,
                                 const size_t len)
 {
-	(void)F; (void)buf; (void)len;
-	return -1;
+	if (F == NULL || buf == NULL)
+	{
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (F->ssl == NULL)
+	{
+		opssl_ctx_t *ctx = ssl_ctx;
+		if (ctx == NULL)
+		{
+			errno = ENOTSUP;
+			return -1;
+		}
+		F->ssl = opssl_conn_new(ctx, op_get_fd(F), OPSSL_DIR_OUTBOUND);
+		if (F->ssl == NULL)
+		{
+			errno = ENOMEM;
+			return -1;
+		}
+		F->type |= OP_FD_SSL;
+		F->tls_outgoing = true;
+	}
+
+	return opssl_conn_import(SSL_P(F), buf, len);
 }
 
 int
@@ -720,7 +993,10 @@ op_ssl_export_keying_material(op_fde_t *const F,
                               const uint8_t *const context, const size_t context_len)
 {
 	if (F == NULL || F->ssl == NULL || out == NULL || label == NULL || outlen == 0)
+	{
+		errno = EINVAL;
 		return 0;
+	}
 
 	return (opssl_conn_export_keying_material(SSL_P(F),
 	        out, outlen, label, context, context_len) == 0) ? 1 : 0;
@@ -766,7 +1042,7 @@ build_ssl_ctx(const char *certfile, const char *keyfile,
 		return NULL;
 	}
 
-	if (opssl_ctx_use_certificate_chain_file(ctx, certfile) != 0)
+	if (!opssl_ctx_use_certificate_chain_file(ctx, certfile))
 	{
 		op_lib_log("%s: opssl_ctx_use_certificate_chain_file ('%s') failed",
 		           __func__, certfile);
@@ -775,7 +1051,7 @@ build_ssl_ctx(const char *certfile, const char *keyfile,
 	}
 	op_lib_log("%s: loaded certificate chain '%s'", __func__, certfile);
 
-	if (opssl_ctx_use_private_key_file(ctx, keyfile) != 0)
+	if (!opssl_ctx_use_private_key_file(ctx, keyfile))
 	{
 		op_lib_log("%s: opssl_ctx_use_private_key_file ('%s') failed",
 		           __func__, keyfile);
@@ -784,7 +1060,7 @@ build_ssl_ctx(const char *certfile, const char *keyfile,
 	}
 	op_lib_log("%s: loaded private key '%s'", __func__, keyfile);
 
-	if (opssl_ctx_check_private_key(ctx) != 0)
+	if (!opssl_ctx_check_private_key(ctx))
 	{
 		op_lib_log("%s: certificate/key mismatch (cert='%s', key='%s')",
 		           __func__, certfile, keyfile);
@@ -801,27 +1077,33 @@ build_ssl_ctx(const char *certfile, const char *keyfile,
 		op_lib_log("%s: DH parameters file not readable: '%s': %s",
 		           __func__, dhfile, strerror(errno));
 	}
-	else if (opssl_ctx_use_dh_params_file(ctx, dhfile) != 0)
+	else if (!opssl_ctx_use_dh_params_file(ctx, dhfile))
 	{
 		op_lib_log("%s: opssl_ctx_use_dh_params_file ('%s') failed — "
 		           "run 'python3 setup.py' to regenerate dhparams.pem",
 		           __func__, dhfile);
 	}
 
-	if (cipherlist != NULL)
-		opssl_ctx_set_ciphersuites(ctx, cipherlist);
+	if (cipherlist != NULL) {
+		if (!opssl_ctx_set_ciphersuites(ctx, cipherlist))
+			op_lib_log("%s: opssl_ctx_set_ciphersuites('%s') failed",
+			           __func__, cipherlist);
+	}
 
 	opssl_ctx_disable_session_cache(ctx);
 
+	bool have_client_ca = false;
 	if (ca_cert && *ca_cert)
 	{
-		if (opssl_ctx_load_verify_locations(ctx, ca_cert, NULL) != 0)
+		if (!opssl_ctx_load_verify_locations(ctx, ca_cert, NULL))
 			op_lib_log("%s: opssl_ctx_load_verify_locations('%s') failed — "
 			           "client certificate CA verification will not work",
 			           __func__, ca_cert);
+		else
+			have_client_ca = true;
 	}
 
-	if (verify)
+	if (verify && have_client_ca)
 		opssl_ctx_set_verify(ctx, true, NULL, NULL);
 
 	opssl_ctx_set_options(ctx,
@@ -832,9 +1114,17 @@ build_ssl_ctx(const char *certfile, const char *keyfile,
 		OPSSL_OPT_SINGLE_DH_USE |
 		OPSSL_OPT_SINGLE_ECDH_USE);
 
-	opssl_ctx_set_curves(ctx, "X25519:P-521:P-384:P-256");
+	if (!opssl_ctx_set_curves(ctx, "X25519:P-521:P-384:P-256"))
+		op_lib_log("%s: opssl_ctx_set_curves failed", __func__);
 
 	opssl_ctx_enable_postquantum(ctx, true);
+
+	/*
+	 * Always request an optional client certificate on server listeners so
+	 * certfp-based features such as SASL EXTERNAL can see the peer cert.
+	 * Peer verification remains gated by verify && have_client_ca above.
+	 */
+	opssl_ctx_set_request_client_cert(ctx, true);
 
 	return ctx;
 }
@@ -864,8 +1154,10 @@ op_setup_ssl_server(const char *const certfile, const char *keyfile,
 		if (ssl_client_ctx != NULL)
 		{
 			const char *kf = (keyfile && *keyfile) ? keyfile : certfile;
-			opssl_ctx_use_certificate_chain_file(ssl_client_ctx, certfile);
-			opssl_ctx_use_private_key_file(ssl_client_ctx, kf);
+			if (!opssl_ctx_use_certificate_chain_file(ssl_client_ctx, certfile))
+				op_lib_log("%s: client cert chain '%s' failed", __func__, certfile);
+			if (!opssl_ctx_use_private_key_file(ssl_client_ctx, kf))
+				op_lib_log("%s: client private key '%s' failed", __func__, kf);
 		}
 	}
 
@@ -880,10 +1172,10 @@ op_setup_ssl_server_sni(const char *const hostname,
                         bool verify, const char *ca_cert,
                         const char *min_tls_version)
 {
-	if (hostname == NULL || *hostname == '\0')
+	if (!tls_hostname_valid(hostname))
 	{
-		op_lib_log("%s: empty hostname; use op_setup_ssl_server for the default certificate",
-		           __func__);
+		op_lib_log("%s: invalid hostname '%s'; use op_setup_ssl_server for the default certificate",
+		           __func__, hostname ? hostname : "(null)");
 		return 0;
 	}
 
@@ -898,8 +1190,9 @@ op_setup_ssl_server_sni(const char *const hostname,
 		{
 			opssl_ctx_free(sni_table[i].ctx);
 			sni_table[i].ctx = ctx;
-			if (ssl_ctx)
-				opssl_ctx_add_sni(ssl_ctx, hostname, ctx);
+			if (ssl_ctx && !opssl_ctx_add_sni(ssl_ctx, hostname, ctx))
+				op_lib_log("%s: failed to attach updated SNI '%s' to default context",
+				           __func__, hostname);
 			op_lib_log("%s: updated SNI certificate for '%s'", __func__, hostname);
 			return 1;
 		}
@@ -924,8 +1217,9 @@ op_setup_ssl_server_sni(const char *const hostname,
 	sni_table[sni_count].ctx = ctx;
 	sni_count++;
 
-	if (ssl_ctx)
-		opssl_ctx_add_sni(ssl_ctx, hostname, ctx);
+	if (ssl_ctx && !opssl_ctx_add_sni(ssl_ctx, hostname, ctx))
+		op_lib_log("%s: failed to attach SNI '%s' to default context",
+		           __func__, hostname);
 
 	op_lib_log("%s: registered SNI certificate for '%s'", __func__, hostname);
 	return 1;
@@ -943,10 +1237,30 @@ op_init_prng(const char *const path, prng_seed_t seed_type)
 int
 op_get_random(void *const buf, const size_t length)
 {
-	if (getrandom(buf, length, 0) != (ssize_t)length)
-	{
-		op_lib_log("%s: getrandom: %s", __func__, strerror(errno));
+	if (length == 0)
+		return 1;
+	if (buf == NULL)
 		return 0;
+
+	size_t done = 0;
+	uint8_t *p = buf;
+
+	while (done < length) {
+		size_t want = length - done;
+		if (want > 256 * 1024)
+			want = 256 * 1024;
+		ssize_t n = getrandom(p + done, want, 0);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			op_lib_log("%s: getrandom: %s", __func__, strerror(errno));
+			return 0;
+		}
+		if (n == 0) {
+			op_lib_log("%s: getrandom returned 0 bytes", __func__);
+			return 0;
+		}
+		done += (size_t)n;
 	}
 
 	return 1;
@@ -976,9 +1290,7 @@ op_get_ssl_certfp(op_fde_t *const F, uint8_t certfp[const OP_SSL_CERTFP_LEN], co
 	if (peer_cert == NULL)
 		return 0;
 
-	const int len = make_certfp(peer_cert, certfp, method);
-	opssl_x509_free(peer_cert);
-	return len;
+	return make_certfp(peer_cert, certfp, method);
 }
 
 int
@@ -1028,6 +1340,14 @@ op_ssl_get_cipher(op_fde_t *const F)
 ssize_t
 op_ssl_read(op_fde_t *const F, void *const buf, const size_t count)
 {
+	if (F == NULL || buf == NULL)
+	{
+		errno = EINVAL;
+		return OP_RW_IO_ERROR;
+	}
+	if (count == 0)
+		return 0;
+
 #ifdef HAVE_KERNEL_TLS
 	if (F->ktls)
 	{
@@ -1102,6 +1422,11 @@ op_ssl_read(op_fde_t *const F, void *const buf, const size_t count)
 		return r;
 	}
 #endif
+	if (F->ssl == NULL)
+	{
+		errno = ENOTCONN;
+		return OP_RW_SSL_ERROR;
+	}
 	return op_ssl_read_or_write(0, F, buf, NULL, count);
 }
 
@@ -1116,6 +1441,14 @@ op_ssl_pending(op_fde_t *const F)
 ssize_t
 op_ssl_write(op_fde_t *const F, const void *const buf, const size_t count)
 {
+	if (F == NULL || buf == NULL)
+	{
+		errno = EINVAL;
+		return OP_RW_IO_ERROR;
+	}
+	if (count == 0)
+		return 0;
+
 #ifdef HAVE_KERNEL_TLS
 	if (F->ktls)
 	{
@@ -1140,7 +1473,23 @@ op_ssl_write(op_fde_t *const F, const void *const buf, const size_t count)
 		return r;
 	}
 #endif
-	return op_ssl_read_or_write(1, F, NULL, buf, count);
+	if (F->ssl == NULL)
+	{
+		errno = ENOTCONN;
+		return OP_RW_SSL_ERROR;
+	}
+
+	ssize_t ret = op_ssl_read_or_write(1, F, NULL, buf, count);
+	if (ret > 0)
+	{
+		opssl_result_t flush_rc = opssl_conn_flush_write(SSL_P(F));
+		if (flush_rc == OPSSL_WANT_WRITE)
+			op_setselect(F, OP_SELECT_WRITE, op_ssl_flush_pending_write, NULL);
+		else if (flush_rc != OPSSL_OK)
+			op_lib_log("%s: post-write TLS flush failed fd %d: %s",
+			           __func__, op_get_fd(F), opssl_conn_get_error_string(SSL_P(F)));
+	}
+	return ret;
 }
 
 
@@ -1171,18 +1520,28 @@ op_ssl_connect_realcb(op_fde_t *const F, const int status, struct ssl_connect *c
 static void
 op_ssl_timeout_cb(op_fde_t *const F, void *const data __attribute__((unused)))
 {
+	if (F == NULL)
+		return;
+
+	op_settimeout(F, 0, NULL, NULL);
+	op_setselect(F, OP_SELECT_READ | OP_SELECT_WRITE, NULL, NULL);
+
 	struct acceptdata *const ad = F->accept;
 	if (ad == NULL)
 		return;
-	slop_assert(ad->callback != NULL);
+
 	F->accept = NULL;
-	ad->callback(F, OP_ERR_TIMEOUT, NULL, 0, ad->data);
+
+	if (ad->callback)
+		ad->callback(F, OP_ERR_TIMEOUT, NULL, 0, ad->data);
+
 	op_acceptdata_free(ad);
 }
 
 static void
 op_ssl_tryconn_timeout_cb(op_fde_t *const F, void *const data)
 {
+	op_settimeout(F, 0, NULL, NULL);
 	op_setselect(F, OP_SELECT_READ | OP_SELECT_WRITE, NULL, NULL);
 	op_ssl_connect_realcb(F, OP_ERR_TIMEOUT, data);
 }
@@ -1203,7 +1562,8 @@ op_ssl_tryconn(op_fde_t *const F, const int status, void *const data)
 	F->type |= OP_FD_SSL;
 
 	op_settimeout(F, sconn->timeout, op_ssl_tryconn_timeout_cb, sconn);
-	if (op_ssl_init_fd(F, OP_FD_TLS_DIRECTION_OUT, sconn->sni_hostname, false) < 0)
+	const char *alpn = sconn->alpn[0] ? sconn->alpn : NULL;
+	if (op_ssl_init_fd(F, OP_FD_TLS_DIRECTION_OUT, sconn->sni_hostname, false, alpn) < 0)
 	{
 		op_settimeout(F, 0, NULL, NULL);
 		op_ssl_connect_realcb(F, OP_ERROR_SSL, sconn);
@@ -1249,7 +1609,7 @@ op_ssl_start_accepted(op_fde_t *const F, ACCB *const cb, void *const data, const
 	(void) memset(&F->accept->S, 0x00, sizeof F->accept->S);
 
 	op_settimeout(F, timeout, op_ssl_timeout_cb, NULL);
-	if (op_ssl_init_fd(F, OP_FD_TLS_DIRECTION_IN, NULL, wsock) < 0)
+	if (op_ssl_init_fd(F, OP_FD_TLS_DIRECTION_IN, NULL, wsock, NULL) < 0)
 	{
 		errno = EIO;
 		accept_teardown(F);
@@ -1274,7 +1634,7 @@ op_ssl_accept_setup(op_fde_t *const srv_F, op_fde_t *const cli_F, struct sockadd
 	(void) memcpy(&cli_F->accept->S, st, (size_t) safe_addrlen);
 
 	op_settimeout(cli_F, OP_SSL_ACCEPT_TIMEOUT_DEFAULT, op_ssl_timeout_cb, NULL);
-	if (op_ssl_init_fd(cli_F, OP_FD_TLS_DIRECTION_IN, NULL, wsock) < 0)
+	if (op_ssl_init_fd(cli_F, OP_FD_TLS_DIRECTION_IN, NULL, wsock, NULL) < 0)
 	{
 		errno = EIO;
 		accept_teardown(cli_F);
@@ -1295,23 +1655,60 @@ op_ssl_listen(op_fde_t *const F, const int backlog, const int defer_accept)
 }
 
 void
-op_connect_tcp_ssl(op_fde_t *const F, struct sockaddr *const dest, struct sockaddr *const clocal,
-                   CNCB *const callback, void *const data, const int timeout,
-                   const char *const sni_hostname)
+op_connect_tcp_ssl_ex(op_fde_t *const F, struct sockaddr *const dest, struct sockaddr *const clocal,
+                      CNCB *const callback, void *const data, const int timeout,
+                      const char *const sni_hostname, const char *const alpn)
 {
 	if (F == NULL)
 		return;
 
 	struct ssl_connect *const sconn = op_malloc(sizeof *sconn);
+	if (!sconn) {
+		if (callback)
+			callback(F, OP_ERROR, data);
+		return;
+	}
 	sconn->data = data;
 	sconn->callback = callback;
 	sconn->timeout = timeout;
 	if (sni_hostname && *sni_hostname)
+	{
+		if (!tls_hostname_valid(sni_hostname))
+		{
+			op_lib_log("%s: invalid SNI hostname '%s'", __func__, sni_hostname);
+			op_free(sconn);
+			if (callback)
+				callback(F, OP_ERROR, data);
+			return;
+		}
 		op_strlcpy(sconn->sni_hostname, sni_hostname, sizeof sconn->sni_hostname);
+	}
 	else
 		sconn->sni_hostname[0] = '\0';
+	if (alpn && *alpn)
+	{
+		if (!tls_alpn_valid(alpn))
+		{
+			op_lib_log("%s: invalid ALPN '%s'", __func__, alpn);
+			op_free(sconn);
+			if (callback)
+				callback(F, OP_ERROR, data);
+			return;
+		}
+		op_strlcpy(sconn->alpn, alpn, sizeof sconn->alpn);
+	}
+	else
+		sconn->alpn[0] = '\0';
 
 	op_connect_tcp(F, dest, clocal, op_ssl_tryconn, sconn, timeout);
+}
+
+void
+op_connect_tcp_ssl(op_fde_t *const F, struct sockaddr *const dest, struct sockaddr *const clocal,
+                   CNCB *const callback, void *const data, const int timeout,
+                   const char *const sni_hostname)
+{
+	op_connect_tcp_ssl_ex(F, dest, clocal, callback, data, timeout, sni_hostname, NULL);
 }
 
 void
@@ -1321,18 +1718,31 @@ op_ssl_start_connected(op_fde_t *const F, CNCB *const callback, void *const data
 		return;
 
 	struct ssl_connect *const sconn = op_malloc(sizeof *sconn);
+	if (!sconn) {
+		if (callback)
+			callback(F, OP_ERROR, data);
+		return;
+	}
 	sconn->data = data;
 	sconn->callback = callback;
 	sconn->timeout = timeout;
 	sconn->sni_hostname[0] = '\0';
+	sconn->alpn[0] = '\0';
 
 	F->connect = op_conndata_alloc();
+	if (!F->connect) {
+		op_free(sconn);
+		if (callback)
+			callback(F, OP_ERROR, data);
+		return;
+	}
 	F->connect->callback = callback;
 	F->connect->data = data;
 	F->type |= OP_FD_SSL;
 
 	op_settimeout(F, sconn->timeout, op_ssl_tryconn_timeout_cb, sconn);
-	if (op_ssl_init_fd(F, OP_FD_TLS_DIRECTION_OUT, sconn->sni_hostname, false) < 0)
+	const char *alpn2 = sconn->alpn[0] ? sconn->alpn : NULL;
+	if (op_ssl_init_fd(F, OP_FD_TLS_DIRECTION_OUT, sconn->sni_hostname, false, alpn2) < 0)
 	{
 		op_settimeout(F, 0, NULL, NULL);
 		op_ssl_connect_realcb(F, OP_ERROR_SSL, sconn);

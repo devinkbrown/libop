@@ -162,10 +162,20 @@ uring_arm_wakeup(void)
  */
 static _Atomic(op_fde_t *) uring_dirty_inbox = NULL;
 
-/* Push F to the dirty list if not already there (idempotent). */
+/* Push F to the dirty list if not already there (idempotent).
+ *
+ * Guard against closed/freed FDEs: worker threads may hold stale op_fde_t
+ * pointers after close_connection() runs on the main thread.  The IsFDOpen
+ * check is racy (flags is not atomic), but the worst case is a benign push
+ * of a closed-but-not-yet-freed FDE — uring_flush_dirty() skips it, and
+ * op_close_pending_fds() defers freeing while uring_dirty is set.
+ */
 static inline void
 uring_mark_dirty(op_fde_t *F)
 {
+	if (!IsFDOpen(F))
+		return;
+
 	if (atomic_exchange_explicit(&F->uring_dirty, 1, memory_order_relaxed))
 		return;  /* already in the dirty list */
 
@@ -360,15 +370,6 @@ op_arm_uring(op_fde_t *F)
 		return 1;
 	}
 
-#if defined(IORING_POLL_ADD_MULTI)
-	/* For multishot polls, always arm both POLLIN and POLLOUT.
-	 * This eliminates cancel+re-arm churn when workers toggle POLLOUT
-	 * interest — the multishot stays alive for the fd's entire lifetime.
-	 * Unwanted POLLOUT CQEs are harmless (handler is NULL → skip). */
-	if (uring_has_multishot)
-		mask = POLLIN | POLLOUT;
-#endif
-
 	sqe = io_uring_get_sqe(&uring);
 	if (sqe == NULL)
 	{
@@ -560,16 +561,16 @@ uring_flush_dirty(void)
 		else if (has_handlers && is_pending
 		         && (F->pflags & URING_F_MULTISHOT))
 		{
-			/* Multi-shot poll active: since op_arm_uring always arms
-			 * POLLIN|POLLOUT for multishot, the armed mask already
-			 * covers any handler combination.  Only cancel+re-arm if
-			 * somehow new interest bits appear (shouldn't happen). */
+			/* Multi-shot poll active: keep the kernel poll mask exactly
+			 * aligned with active handlers.  POLLOUT is level-triggered
+			 * on almost every TCP socket; arming it without a write
+			 * handler creates a permanent CQE storm that starves the IRC
+			 * loop and makes both plain and TLS clients appear to hang. */
 			unsigned int want = 0;
 			if (F->read_handler  != NULL) want |= URING_ARMED_IN;
 			if (F->write_handler != NULL) want |= URING_ARMED_OUT;
 			unsigned int have = F->pflags & URING_ARMED_MASK;
-			unsigned int new_interest = want & ~have;
-			if (new_interest != 0)
+			if (want != have)
 			{
 				op_cancel_uring(F);
 				if (!op_arm_uring(F))
@@ -806,6 +807,9 @@ void
 op_setselect_uring(op_fde_t *F, unsigned int type, PF *handler,
                    void *client_data)
 {
+	if (!IsFDOpen(F))
+		return;
+
 	pthread_spin_lock(&F->pflags_lock);
 
 	if (type & OP_SELECT_READ)
@@ -895,7 +899,7 @@ uring_sweep_stale_polls(void)
 		{
 			op_fde_t *F = ptr->data;
 
-			if (!IsFDOpen(F))
+			if (F == NULL || !IsFDOpen(F))
 				continue;
 
 			pthread_spin_lock(&F->pflags_lock);
@@ -1019,6 +1023,9 @@ op_select_uring(long delay)
 		return OP_OK;
 	}
 	/* else: fall through to inline path */
+	static unsigned long spin_count;
+	static time_t        spin_last_log;
+
 	struct io_uring_cqe  *cqe;
 	struct __kernel_timespec ts;
 	unsigned int          head;
@@ -1166,7 +1173,7 @@ op_select_uring(long delay)
 			continue;
 		}
 
-poll_dispatch:
+poll_dispatch:;
 		/* Multi-shot poll: if IORING_CQE_F_MORE is set, the kernel will
 		 * send more CQEs from this POLL_ADD — keep PENDING set.
 		 * Otherwise (oneshot or final multi-shot CQE), clear PENDING
@@ -1256,6 +1263,19 @@ poll_dispatch:
 	/* Periodic sweep for silently dead multishot polls. */
 	uring_sweep_stale_polls();
 	uring_flush_dirty();
+
+	spin_count++;
+	{
+		time_t now = op_current_time();
+		if (now != spin_last_log)
+		{
+			if (spin_count > 100)
+				op_lib_log("uring_spin: %lu iter/s  cqe_this=%u",
+				           spin_count, count);
+			spin_count = 0;
+			spin_last_log = now;
+		}
+	}
 
 	return OP_OK;
 }

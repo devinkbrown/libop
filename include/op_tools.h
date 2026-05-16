@@ -30,17 +30,17 @@
 #ifndef __TOOLS_H__
 #define __TOOLS_H__
 
-int op_strcasecmp(const char *s1, const char *s2);
-int op_strncasecmp(const char *s1, const char *s2, size_t n);
-char *op_strcasestr(const char *s, const char *find);
-size_t op_strlcpy(char *dst, const char *src, size_t siz);
-size_t op_strlcat(char *dst, const char *src, size_t siz);
-size_t op_strnlen(const char *s, size_t count);
-int op_snprintf_append(char *str, size_t len, const char *format, ...) AFP(3,4);
-int op_snprintf_try_append(char *str, size_t len, const char *format, ...) AFP(3,4);
+OP_PURE OP_NONNULL(1, 2) int op_strcasecmp(const char *s1, const char *s2);
+OP_PURE OP_NONNULL(1, 2) int op_strncasecmp(const char *s1, const char *s2, size_t n);
+OP_PURE OP_NONNULL(1, 2) char *op_strcasestr(const char *s, const char *find);
+OP_NONNULL(1, 2) size_t op_strlcpy(char *dst, const char *src, size_t siz);
+OP_NONNULL(1, 2) size_t op_strlcat(char *dst, const char *src, size_t siz);
+OP_PURE OP_NONNULL(1) size_t op_strnlen(const char *s, size_t count);
+OP_NONNULL(1, 3) int op_snprintf_append(char *str, size_t len, const char *format, ...) AFP(3,4);
+OP_NONNULL(1, 3) int op_snprintf_try_append(char *str, size_t len, const char *format, ...) AFP(3,4);
 
-char *op_basename(const char *);
-char *op_dirname(const char *);
+OP_NONNULL(1) char *op_basename(const char *);
+OP_NONNULL(1) char *op_dirname(const char *);
 
 int op_string_to_array(char *string, char **parv, int maxpara);
 
@@ -363,8 +363,8 @@ typedef struct _op_strf {
 	const struct _op_strf *next;	/* next string to append */
 } op_strf_t;
 
-int op_fsnprint(char *buf, size_t len, const op_strf_t *strings);
-int op_fsnprintf(char *buf, size_t len, const op_strf_t *strings, const char *format, ...) AFP(4, 5);
+OP_NONNULL(1, 3) int op_fsnprint(char *buf, size_t len, const op_strf_t *strings);
+OP_NONNULL(1, 3, 4) int op_fsnprintf(char *buf, size_t len, const op_strf_t *strings, const char *format, ...) AFP(4, 5);
 
 
 const char *op_path_to_self(void);

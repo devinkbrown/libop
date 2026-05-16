@@ -56,10 +56,10 @@ void    op_ws_shutdown(op_fde_t *F);
 struct timeout_data
 {
 	op_fde_t *F;
-	op_dlink_node node;
 	time_t timeout;
 	PF *timeout_handler;
 	void *timeout_data;
+	op_dlink_node node;
 };
 
 op_dlink_list *op_fd_table;
@@ -69,6 +69,8 @@ static op_bh *conn_heap;
 static op_bh *accept_heap;
 
 static op_dlink_list closed_list;
+static op_dlink_list closed_list_aged;
+static op_dlink_list recycled_list;
 
 /* Backend-specific fd cleanup hook — set by try_uring(), NULL for other backends.
  * Declared here (above op_close) because the full io_ops_t vtable lives further
@@ -128,7 +130,17 @@ add_fd(op_platform_fd_t fd)
 	if (F != NULL)
 		return F;
 
-	F = op_bh_alloc(fd_heap);
+	if (recycled_list.head != NULL)
+	{
+		op_dlink_node *n = recycled_list.head;
+		F = n->data;
+		op_dlinkDelete(n, &recycled_list);
+		memset(F, 0, sizeof(*F));
+	}
+	else
+	{
+		F = op_bh_alloc(fd_heap);
+	}
 	F->fd = fd;
 	op_dlinkAdd(F, &F->node, &op_fd_table[op_hash_fd(fd)]);
 	return (F);
@@ -148,34 +160,28 @@ op_close_pending_fds(void)
 {
 	op_fde_t *F;
 	op_dlink_node *ptr, *next;
-	OP_DLINK_FOREACH_SAFE(ptr, next, closed_list.head)
+
+	/*
+	 * Two-cycle deferred recycle: FDEs move closed_list → closed_list_aged
+	 * → recycled_list.  Worker threads may hold stale op_fde_t * pointers
+	 * after close_connection() runs on the main thread; recycling instead
+	 * of freeing keeps the memory valid so IsFDOpen() guards work safely.
+	 *
+	 * Phase 1: recycle aged FDEs that have waited at least one full cycle.
+	 */
+	OP_DLINK_FOREACH_SAFE(ptr, next, closed_list_aged.head)
 	{
 		F = ptr->data;
 
-		/*
-		 * If this fde is still in the io_uring dirty inbox (Treiber
-		 * stack), we must not free it yet — uring_flush_dirty() needs
-		 * to traverse the intrusive linked list through uring_dirty_next.
-		 * Close the underlying fd immediately so we don't leak it, but
-		 * defer freeing the fde memory.  uring_flush_dirty() will clear
-		 * the dirty flag, and we will free the block on the next call.
-		 */
 		if (atomic_load_explicit(&F->uring_dirty, memory_order_acquire))
 		{
-			if (F->fd >= 0)
-			{
-#ifdef _WIN32
-				if (F->type & (OP_FD_SOCKET | OP_FD_PIPE))
-					closesocket(F->fd);
-				else
-#endif
-					close(F->fd);
-				F->fd = -1;
-			}
-			continue;
+			/* The FDE is closed — no uring submission will happen.
+			 * Clear the stale flag so the FDE can be recycled;
+			 * uring_gen was bumped in op_close() to discard any
+			 * in-flight CQE referencing this FDE. */
+			atomic_store_explicit(&F->uring_dirty, 0, memory_order_release);
 		}
 
-		/* number_fd is decremented in op_close_pending_fds after the fd is closed. */
 		if (F->fd >= 0)
 		{
 #ifdef _WIN32
@@ -184,11 +190,34 @@ op_close_pending_fds(void)
 			else
 #endif
 				close(F->fd);
+			F->fd = -1;
 		}
 
-		op_dlinkDelete(ptr, &closed_list);
-		op_bh_free(fd_heap, F);
+		pthread_spin_destroy(&F->pflags_lock);
+		op_dlinkMoveNode(ptr, &closed_list_aged, &recycled_list);
 		atomic_fetch_sub_explicit(&number_fd, 1, memory_order_relaxed);
+	}
+
+	/*
+	 * Phase 2: close underlying fds immediately (don't leak them) and
+	 * promote newly closed FDEs to the aged list for next cycle.
+	 */
+	OP_DLINK_FOREACH_SAFE(ptr, next, closed_list.head)
+	{
+		F = ptr->data;
+
+		if (F->fd >= 0)
+		{
+#ifdef _WIN32
+			if (F->type & (OP_FD_SOCKET | OP_FD_PIPE))
+				closesocket(F->fd);
+			else
+#endif
+				close(F->fd);
+			F->fd = -1;
+		}
+
+		op_dlinkMoveNode(ptr, &closed_list, &closed_list_aged);
 	}
 }
 
@@ -651,6 +680,7 @@ op_sctp_bindx(const op_fde_t *F, const struct sockaddr_storage *addrs, size_t le
 
 	return 0;
 #else
+	(void)F; (void)addrs; (void)len;
 	return -1;
 #endif
 }
@@ -658,6 +688,7 @@ op_sctp_bindx(const op_fde_t *F, const struct sockaddr_storage *addrs, size_t le
 int
 op_inet_get_proto(const op_fde_t *F)
 {
+	(void)F;
 #ifdef HAVE_LIBSCTP
 	if (F->type & OP_FD_SCTP)
 		return IPPROTO_SCTP;
@@ -932,6 +963,12 @@ op_connect_sctp(op_fde_t *F, struct sockaddr_storage *dest, size_t dest_len,
 	}
 	dest_len = n;
 
+	if (dest_len == 0)
+	{
+		op_connect_callback(F, OP_ERR_CONNECT);
+		return;
+	}
+
 	memcpy(&F->connect->hostaddr, &dest[0], sizeof(F->connect->hostaddr));
 
 	if ((clocal_len > 0) && (op_sctp_bindx_only(F, clocal, clocal_len) < 0)) {
@@ -966,6 +1003,8 @@ op_connect_sctp(op_fde_t *F, struct sockaddr_storage *dest, size_t dest_len,
 	/* If we get here, we've succeeded, so call with OP_OK */
 	op_connect_callback(F, OP_OK);
 #else
+	(void)dest; (void)dest_len; (void)clocal; (void)clocal_len;
+	(void)callback; (void)data; (void)timeout;
 	op_connect_callback(F, OP_ERR_CONNECT);
 #endif
 }
@@ -1090,14 +1129,18 @@ op_socketpair(int family, int sock_type, int proto, op_fde_t **F1, op_fde_t **F2
 
 	if (*F1 == NULL)
 	{
+		close(nfd[0]);
 		if (*F2 != NULL)
 			op_close(*F2);
+		else
+			close(nfd[1]);
 		return -1;
 	}
 
 	if (*F2 == NULL)
 	{
 		op_close(*F1);
+		close(nfd[1]);
 		return -1;
 	}
 
@@ -1148,6 +1191,23 @@ op_pipe(op_fde_t **F1, op_fde_t **F2, const char *desc)
 
 	*F1 = op_open(fd[0], OP_FD_PIPE, desc);
 	*F2 = op_open(fd[1], OP_FD_PIPE, desc);
+
+	if (*F1 == NULL)
+	{
+		close(fd[0]);
+		if (*F2 != NULL)
+			op_close(*F2);
+		else
+			close(fd[1]);
+		return -1;
+	}
+
+	if (*F2 == NULL)
+	{
+		op_close(*F1);
+		close(fd[1]);
+		return -1;
+	}
 
 	if (op_unlikely(!op_set_nb(*F1)))
 	{
@@ -1492,6 +1552,7 @@ op_close(op_fde_t *F)
 
 	op_setselect(F, OP_SELECT_WRITE | OP_SELECT_READ, NULL, NULL);
 	op_settimeout(F, 0, NULL, NULL);
+	F->uring_gen++;
 	if (io_close_fd != NULL)
 		io_close_fd(F);
 	if (F->accept)  { op_bh_free(accept_heap, F->accept);  F->accept  = NULL; }
@@ -1510,7 +1571,6 @@ op_close(op_fde_t *F)
 	{
 		remove_fd(F);
 		ClearFDOpen(F);
-		pthread_spin_destroy(&F->pflags_lock);
 	}
 
 	if (type & OP_FD_LISTEN)
@@ -1646,6 +1706,13 @@ op_pending(op_fde_t *F)
 {
 	if (F == NULL)
 		return 0;
+	if (F->type & OP_FD_WEBSOCKET)
+	{
+		int ws_n = op_ws_pending(F);
+		if (F->type & OP_FD_SSL)
+			ws_n += op_ssl_pending(F);
+		return ws_n;
+	}
 	if (F->type & OP_FD_SSL)
 		return op_ssl_pending(F);
 	return 0;

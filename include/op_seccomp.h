@@ -6,7 +6,7 @@
  *
  *   op_seccomp_lockdown()       — deny-exec/fork/ptrace filter for short-lived
  *                                  helper daemons that never spawn children (ssld,
- *                                  wsockd, discordd, authproc).  All other syscalls
+ *                                  wsockd, authproc).  All other syscalls
  *                                  are allowed by default, with two argument-filtered
  *                                  exceptions:
  *                                    • mmap(2) / mprotect(2): killed if PROT_EXEC is

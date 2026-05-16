@@ -332,6 +332,165 @@ test_insert_at_end(void)
     op_vec_fini(&v, NULL, NULL);
 }
 
+static void
+test_remove_ptr(void)
+{
+    SECTION("op_vec_remove_ptr");
+    op_vec_t v;
+    op_vec_init(&v, 0);
+
+    void *a = INT2PTR(10);
+    void *b = INT2PTR(20);
+    void *c = INT2PTR(30);
+    op_vec_push(&v, a);
+    op_vec_push(&v, b);
+    op_vec_push(&v, c);
+
+    op_vec_remove_ptr(&v, b);
+    CHECK(op_vec_size(&v) == 2);
+    CHECK(op_vec_get(&v, 0) == a || op_vec_get(&v, 0) == c);
+    CHECK(op_vec_get(&v, 1) == a || op_vec_get(&v, 1) == c);
+
+    /* remove_ptr on element not present is a no-op */
+    op_vec_remove_ptr(&v, INT2PTR(999));
+    CHECK(op_vec_size(&v) == 2);
+
+    /* remove all remaining */
+    op_vec_remove_ptr(&v, a);
+    op_vec_remove_ptr(&v, c);
+    CHECK(op_vec_empty(&v));
+
+    /* remove_ptr on empty vec is safe */
+    op_vec_remove_ptr(&v, INT2PTR(1));
+    CHECK(op_vec_empty(&v));
+
+    op_vec_fini(&v, NULL, NULL);
+}
+
+static void
+test_contains(void)
+{
+    SECTION("op_vec_contains");
+    op_vec_t v;
+    op_vec_init(&v, 0);
+
+    void *a = INT2PTR(10);
+    void *b = INT2PTR(20);
+    void *c = INT2PTR(30);
+    op_vec_push(&v, a);
+    op_vec_push(&v, b);
+
+    CHECK(op_vec_contains(&v, a) == true);
+    CHECK(op_vec_contains(&v, b) == true);
+    CHECK(op_vec_contains(&v, c) == false);
+    CHECK(op_vec_contains(&v, NULL) == false);
+
+    /* after removal, no longer contains */
+    op_vec_remove_ptr(&v, a);
+    CHECK(op_vec_contains(&v, a) == false);
+    CHECK(op_vec_contains(&v, b) == true);
+
+    /* empty vec contains nothing */
+    op_vec_clear(&v, NULL, NULL);
+    CHECK(op_vec_contains(&v, b) == false);
+
+    op_vec_fini(&v, NULL, NULL);
+}
+
+static void
+test_move_ptr(void)
+{
+    SECTION("op_vec_move_ptr");
+    op_vec_t src, dst;
+    op_vec_init(&src, 0);
+    op_vec_init(&dst, 0);
+
+    void *a = INT2PTR(10);
+    void *b = INT2PTR(20);
+    void *c = INT2PTR(30);
+    op_vec_push(&src, a);
+    op_vec_push(&src, b);
+    op_vec_push(&src, c);
+
+    op_vec_move_ptr(&src, &dst, b);
+    CHECK(op_vec_size(&src) == 2);
+    CHECK(op_vec_size(&dst) == 1);
+    CHECK(op_vec_contains(&src, b) == false);
+    CHECK(op_vec_contains(&dst, b) == true);
+
+    /* move remaining elements */
+    op_vec_move_ptr(&src, &dst, a);
+    op_vec_move_ptr(&src, &dst, c);
+    CHECK(op_vec_empty(&src));
+    CHECK(op_vec_size(&dst) == 3);
+    CHECK(op_vec_contains(&dst, a) == true);
+    CHECK(op_vec_contains(&dst, c) == true);
+
+    /* move_ptr for element not in src still pushes to dst */
+    size_t dst_before = op_vec_size(&dst);
+    op_vec_move_ptr(&src, &dst, INT2PTR(999));
+    CHECK(op_vec_size(&dst) == dst_before + 1);
+
+    op_vec_fini(&src, NULL, NULL);
+    op_vec_fini(&dst, NULL, NULL);
+}
+
+static void
+test_backwards_iteration(void)
+{
+    SECTION("backwards iteration with remove_fast (migration pattern)");
+    op_vec_t v;
+    op_vec_init(&v, 0);
+
+    for (int i = 0; i < 10; i++)
+        op_vec_push(&v, INT2PTR(i));
+
+    /* Remove all even numbers using the backwards iteration pattern */
+    for (size_t i = op_vec_size(&v); i-- > 0; )
+    {
+        int val = PTR2INT(op_vec_get(&v, i));
+        if (val % 2 == 0)
+            op_vec_remove_fast(&v, i);
+    }
+
+    CHECK(op_vec_size(&v) == 5);
+    /* All remaining should be odd */
+    for (size_t i = 0; i < op_vec_size(&v); i++)
+        CHECK(PTR2INT(op_vec_get(&v, i)) % 2 == 1);
+
+    op_vec_fini(&v, NULL, NULL);
+}
+
+static void
+test_nested_foreach(void)
+{
+    SECTION("nested OP_VEC_FOREACH (shadow-safe)");
+    op_vec_t outer, inner;
+    op_vec_init(&outer, 0);
+    op_vec_init(&inner, 0);
+
+    op_vec_push(&outer, INT2PTR(1));
+    op_vec_push(&outer, INT2PTR(2));
+    op_vec_push(&inner, INT2PTR(10));
+    op_vec_push(&inner, INT2PTR(20));
+
+    int total = 0;
+    size_t _i; void *_e;
+    OP_VEC_FOREACH(&outer, _i, _e)
+    {
+        size_t _j; void *_je;
+        OP_VEC_FOREACH(&inner, _j, _je)
+        {
+            total += PTR2INT(_e) * PTR2INT(_je);
+        }
+    }
+    /* (1*10 + 1*20) + (2*10 + 2*20) = 30 + 60 = 90 */
+    CHECK(total == 90);
+
+    op_vec_fini(&outer, NULL, NULL);
+    op_vec_fini(&inner, NULL, NULL);
+}
+
 /* ---- main ---------------------------------------------------------------- */
 
 int
@@ -353,6 +512,11 @@ main(void)
     test_macro_foreach();
     test_heap_create_destroy();
     test_insert_at_end();
+    test_remove_ptr();
+    test_contains();
+    test_move_ptr();
+    test_backwards_iteration();
+    test_nested_foreach();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

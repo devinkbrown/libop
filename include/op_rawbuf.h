@@ -4,7 +4,7 @@
  *
  *  Copyright (C) 2007 Aaron Sethman <androsyn@ratbox.org>
  *  Copyright (C) 2007 ircd-ratbox development team
- *  Copyright (C) 2025 ophion development team
+ *  Copyright (C) 2025-2026 ophion development team
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by

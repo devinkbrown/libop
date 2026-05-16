@@ -25,9 +25,11 @@
 #include <netinet/in.h>
 #include <errno.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <ctype.h>
 
 #include "sha1.h"
 
@@ -58,6 +60,7 @@
  * ~8 KiB (tags + line), so 64 KiB is very generous and prevents memory
  * exhaustion from a malicious peer sending unlimited continuation frames. */
 #define WS_MAX_MESSAGE_SIZE     (64u * 1024u)
+#define WS_MAX_FRAME_SIZE       WS_MAX_MESSAGE_SIZE
 
 #define WEBSOCKET_SERVER_KEY "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -101,30 +104,35 @@ typedef struct {
     /* Fragmentation state (RFC 6455 §5.4) */
     bool    in_fragment;      /* true while receiving a multi-frame message */
     uint8_t fragment_opcode;  /* TEXT or BINARY opcode of the open fragment sequence */
+    size_t  fragment_start;   /* decoded offset where the current fragment began */
 } ws_state_t;
 
 /* -------------------------------------------------------------------------
  * Allocate / free state
  * ---------------------------------------------------------------------- */
 
+static void ws_free(ws_state_t *ws);
+
 static ws_state_t *
 ws_alloc(void)
 {
-    ws_state_t *ws      = op_malloc(sizeof *ws);
-    ws->inbuf           = op_malloc(WS_INBUF_INITIAL);
-    ws->inbuf_len       = 0;
-    ws->inbuf_cap       = WS_INBUF_INITIAL;
-    ws->frame_out       = op_new_rawbuffer();
-    ws->decoded         = op_malloc(WS_DECODED_INITIAL);
-    ws->decoded_cap     = WS_DECODED_INITIAL;
-    ws->decoded_len     = 0;
-    ws->decoded_pos     = 0;
-    ws->hs_buf          = NULL;
-    ws->hs_len          = 0;
-    ws->keyed           = false;
-    ws->sent_close      = false;
-    ws->in_fragment     = false;
-    ws->fragment_opcode = 0;
+    ws_state_t *ws = op_malloc(sizeof *ws);
+    if (!ws)
+        return NULL;
+
+    memset(ws, 0, sizeof *ws);
+
+    ws->inbuf     = op_malloc(WS_INBUF_INITIAL);
+    ws->frame_out = op_new_rawbuffer();
+    ws->decoded   = op_malloc(WS_DECODED_INITIAL);
+
+    if (!ws->inbuf || !ws->frame_out || !ws->decoded) {
+        ws_free(ws);
+        return NULL;
+    }
+
+    ws->inbuf_cap   = WS_INBUF_INITIAL;
+    ws->decoded_cap = WS_DECODED_INITIAL;
     return ws;
 }
 
@@ -140,22 +148,109 @@ ws_free(ws_state_t *ws)
 }
 
 /* -------------------------------------------------------------------------
+ * Small parser helpers
+ * ---------------------------------------------------------------------- */
+
+static char *
+ws_ltrim(char *s)
+{
+    while (*s == ' ' || *s == '\t')
+        s++;
+    return s;
+}
+
+static void
+ws_rtrim(char *s)
+{
+    size_t len = strlen(s);
+    while (len > 0 && (s[len - 1] == ' ' || s[len - 1] == '\t' ||
+                       s[len - 1] == '\r' || s[len - 1] == '\n'))
+        s[--len] = '\0';
+}
+
+static bool
+ws_token_eq(const char *a, const char *b)
+{
+    return op_strcasecmp(a, b) == 0;
+}
+
+static bool
+ws_header_has_token(const char *value, const char *token)
+{
+    const char *p = value;
+
+    while (*p)
+    {
+        while (*p == ' ' || *p == '\t' || *p == ',')
+            p++;
+
+        const char *start = p;
+        while (*p && *p != ',')
+            p++;
+
+        size_t len = (size_t)(p - start);
+        while (len > 0 && (start[len - 1] == ' ' || start[len - 1] == '\t'))
+            len--;
+
+        if (strlen(token) == len && strncasecmp(start, token, len) == 0)
+            return true;
+    }
+
+    return false;
+}
+
+static bool
+ws_header_selects_protocol(const char *value, const char *protocol)
+{
+    return ws_header_has_token(value, protocol);
+}
+
+static bool
+ws_client_key_valid(const char *key)
+{
+    size_t key_len = strlen(key);
+    size_t decoded_len = 0;
+
+    if (key_len != 24)
+        return false;
+
+    for (size_t i = 0; i < key_len; i++)
+    {
+        unsigned char c = (unsigned char)key[i];
+        if (!(isalnum(c) || c == '+' || c == '/' || c == '='))
+            return false;
+    }
+
+    unsigned char *decoded = op_base64_decode((const unsigned char *)key,
+                                              key_len, &decoded_len);
+    if (decoded == NULL)
+        return false;
+
+    op_free(decoded);
+    return decoded_len == 16;
+}
+
+/* -------------------------------------------------------------------------
  * inbuf helpers
  * ---------------------------------------------------------------------- */
 
-/* Ensure inbuf has room for `extra` more bytes. */
-static void
+/* Ensure inbuf has room for `extra` more bytes.  Returns false on OOM. */
+static bool
 inbuf_grow(ws_state_t *ws, size_t extra)
 {
     if (op_unlikely(extra > SIZE_MAX - ws->inbuf_len))
-        abort();
+        return false;
     size_t need = ws->inbuf_len + extra;
     if (need > ws->inbuf_cap)
     {
         size_t newcap  = need + WS_INBUF_INITIAL;
-        ws->inbuf      = op_realloc(ws->inbuf, newcap);
+        uint8_t *nb    = op_realloc(ws->inbuf, newcap);
+        if (!nb)
+            return false;
+        ws->inbuf      = nb;
         ws->inbuf_cap  = newcap;
     }
+    return true;
 }
 
 /* Consume `n` bytes from the front of inbuf. */
@@ -178,10 +273,9 @@ inbuf_consume(ws_state_t *ws, size_t n)
  * ---------------------------------------------------------------------- */
 
 /* Returns false if the aggregate message exceeds WS_MAX_MESSAGE_SIZE. */
-static bool
-decoded_append(ws_state_t *ws, const uint8_t *data, size_t len)
+static void
+decoded_compact(ws_state_t *ws)
 {
-    /* Compact: slide unread bytes to front */
     if (ws->decoded_pos > 0)
     {
         size_t avail = ws->decoded_len - ws->decoded_pos;
@@ -190,6 +284,12 @@ decoded_append(ws_state_t *ws, const uint8_t *data, size_t len)
         ws->decoded_len = avail;
         ws->decoded_pos = 0;
     }
+}
+
+static bool
+decoded_append(ws_state_t *ws, const uint8_t *data, size_t len)
+{
+    decoded_compact(ws);
 
     if (op_unlikely(len > SIZE_MAX - ws->decoded_len))
         return false;
@@ -199,7 +299,10 @@ decoded_append(ws_state_t *ws, const uint8_t *data, size_t len)
     if (need > ws->decoded_cap)
     {
         size_t newcap   = need + WS_DECODED_INITIAL;
-        ws->decoded     = op_realloc(ws->decoded, newcap);
+        uint8_t *nb     = op_realloc(ws->decoded, newcap);
+        if (!nb)
+            return false;
+        ws->decoded     = nb;
         ws->decoded_cap = newcap;
     }
     memcpy(ws->decoded + ws->decoded_len, data, len);
@@ -215,25 +318,35 @@ static void
 ws_write_frame_raw(ws_state_t *ws, uint8_t first_byte,
                    const uint8_t *payload, size_t len)
 {
-    uint8_t hdr[4];
+    uint8_t hdr[10];
     size_t  hdrsz;
 
     hdr[0] = first_byte;
-    /* Clamp before encoding the length field so the header and payload
-     * are always consistent.  IRC lines never legitimately exceed 65535
-     * bytes, so truncation here indicates a caller bug. */
-    if (len > 65535) len = 65535;
     if (len < 126)
     {
         hdr[1] = (uint8_t)len;
         hdrsz  = 2;
     }
-    else
+    else if (len <= 65535)
     {
         hdr[1] = 126;
         hdr[2] = (uint8_t)(len >> 8);
         hdr[3] = (uint8_t)(len & 0xff);
         hdrsz  = 4;
+    }
+    else
+    {
+        uint64_t v = (uint64_t)len;
+        hdr[1] = 127;
+        hdr[2] = (uint8_t)(v >> 56);
+        hdr[3] = (uint8_t)(v >> 48);
+        hdr[4] = (uint8_t)(v >> 40);
+        hdr[5] = (uint8_t)(v >> 32);
+        hdr[6] = (uint8_t)(v >> 24);
+        hdr[7] = (uint8_t)(v >> 16);
+        hdr[8] = (uint8_t)(v >> 8);
+        hdr[9] = (uint8_t)v;
+        hdrsz  = 10;
     }
     op_rawbuf_append(ws->frame_out, hdr, hdrsz);
     if (len > 0)
@@ -356,9 +469,26 @@ ws_parse_frames(op_fde_t *F, ws_state_t *ws)
         }
         else if (payload_len == 127)
         {
-            /* 8-byte extended length — IRC messages are never this large */
             if (ws->inbuf_len < consumed + 8) break;
-            ws_write_close_frame(ws, WS_CLOSE_TOO_LARGE);
+            uint64_t v = 0;
+            for (int i = 0; i < 8; i++)
+                v = (v << 8) | p[consumed + i];
+            consumed += 8;
+
+            if ((v & UINT64_C(0x8000000000000000)) != 0 ||
+                v > WS_MAX_FRAME_SIZE)
+            {
+                ws_write_close_frame(ws, WS_CLOSE_TOO_LARGE);
+                op_rawbuf_flush(ws->frame_out, F);
+                return false;
+            }
+            payload_len = (size_t)v;
+        }
+
+        /* RFC 6455 §5.1: clients MUST mask every frame sent to servers. */
+        if (!masked)
+        {
+            ws_write_close_frame(ws, WS_CLOSE_PROTOCOL_ERROR);
             op_rawbuf_flush(ws->frame_out, F);
             return false;
         }
@@ -392,33 +522,24 @@ ws_parse_frames(op_fde_t *F, ws_state_t *ws)
 
         /* Masking key */
         uint8_t mask_key[4] = { 0, 0, 0, 0 };
-        if (masked)
-        {
-            if (ws->inbuf_len < consumed + 4) break;
-            memcpy(mask_key, p + consumed, 4);
-            consumed += 4;
-        }
+        if (ws->inbuf_len < consumed + 4) break;
+        memcpy(mask_key, p + consumed, 4);
+        consumed += 4;
 
         /* Full payload available? */
         if (ws->inbuf_len < consumed + payload_len) break;
 
-        /* Unmask into a local buffer */
-        uint8_t *payload_buf = (uint8_t *)(p + consumed);
-        uint8_t  local_buf[WS_READBUF_SIZE];
-        if (payload_len > 0 && payload_len <= sizeof local_buf)
-        {
-            memcpy(local_buf, payload_buf, payload_len);
-            if (masked)
-                for (size_t i = 0; i < payload_len; i++)
-                    local_buf[i] ^= mask_key[i & 3];
-            payload_buf = local_buf;
-        }
-        else if (payload_len > sizeof local_buf)
+        if (payload_len > WS_MAX_FRAME_SIZE)
         {
             ws_write_close_frame(ws, WS_CLOSE_TOO_LARGE);
             op_rawbuf_flush(ws->frame_out, F);
             return false;
         }
+
+        /* Unmask in-place; the bytes are consumed from inbuf after dispatch. */
+        uint8_t *payload_buf = ws->inbuf + consumed;
+        for (size_t i = 0; i < payload_len; i++)
+            payload_buf[i] ^= mask_key[i & 3];
 
         consumed += payload_len;
 
@@ -429,6 +550,10 @@ ws_parse_frames(op_fde_t *F, ws_state_t *ws)
         case WS_OPCODE_BINARY:   /* treat binary frames same as text for IRC */
         case WS_OPCODE_CONT:
         {
+            decoded_compact(ws);
+            size_t msg_start = (opcode == WS_OPCODE_CONT)
+                               ? ws->fragment_start
+                               : ws->decoded_len;
             /* is_text: true when the message's data type is TEXT (for UTF-8
              * validation).  For CONT frames, use the type of the first frame
              * in the sequence (stored in fragment_opcode).  For new TEXT or
@@ -440,13 +565,6 @@ ws_parse_frames(op_fde_t *F, ws_state_t *ws)
             {
                 if (payload_len > 0)
                 {
-                    /* UTF-8 validation on final frame of a text message. */
-                    if (fin && is_text && !ws_is_valid_utf8(payload_buf, payload_len))
-                    {
-                        ws_write_close_frame(ws, WS_CLOSE_INVALID_UTF8);
-                        op_rawbuf_flush(ws->frame_out, F);
-                        return false;
-                    }
                     if (!decoded_append(ws, payload_buf, payload_len))
                     {
                         ws_write_close_frame(ws, WS_CLOSE_TOO_LARGE);
@@ -456,7 +574,21 @@ ws_parse_frames(op_fde_t *F, ws_state_t *ws)
                 }
                 /* CRLF only on the final (or only) frame of the message. */
                 if (fin)
-                    decoded_append(ws, (const uint8_t *)"\r\n", 2);
+                {
+                    if (is_text && !ws_is_valid_utf8(ws->decoded + msg_start,
+                                                     ws->decoded_len - msg_start))
+                    {
+                        ws_write_close_frame(ws, WS_CLOSE_INVALID_UTF8);
+                        op_rawbuf_flush(ws->frame_out, F);
+                        return false;
+                    }
+                    if (!decoded_append(ws, (const uint8_t *)"\r\n", 2))
+                    {
+                        ws_write_close_frame(ws, WS_CLOSE_TOO_LARGE);
+                        op_rawbuf_flush(ws->frame_out, F);
+                        return false;
+                    }
+                }
             }
 
             /* Update fragmentation state:
@@ -467,10 +599,13 @@ ws_parse_frames(op_fde_t *F, ws_state_t *ws)
             {
                 ws->fragment_opcode = (uint8_t)opcode;
                 ws->in_fragment     = !fin;
+                ws->fragment_start  = msg_start;
             }
             else /* CONT */
             {
                 ws->in_fragment = !fin;
+                if (!ws->in_fragment)
+                    ws->fragment_start = 0;
             }
             break;
         }
@@ -619,7 +754,8 @@ op_ws_handshake_read(op_fde_t *F, void *data)
             size_t frame_len   = (ws->hs_buf + ws->hs_len) - frame_start;
             if (frame_len > 0)
             {
-                inbuf_grow(ws, frame_len);
+                if (!inbuf_grow(ws, frame_len))
+                    goto fail;
                 memcpy(ws->inbuf + ws->inbuf_len, frame_start, frame_len);
                 ws->inbuf_len += frame_len;
             }
@@ -628,12 +764,26 @@ op_ws_handshake_read(op_fde_t *F, void *data)
         /* --- Parse HTTP headers ---------------------------------------- */
         char client_key[64]  = "";
         char ws_subproto[64] = "";
+        int  have_request    = 0;
         int  have_upgrade    = 0;
         int  have_connection = 0;
         int  have_version    = 0;
 
         char *line = strchr(ws->hs_buf, '\n');
-        if (line) line++;
+        if (line)
+        {
+            char request_line[256];
+            size_t request_len = (size_t)(line - ws->hs_buf);
+            if (request_len < sizeof(request_line))
+            {
+                memcpy(request_line, ws->hs_buf, request_len);
+                request_line[request_len] = '\0';
+                ws_rtrim(request_line);
+                have_request = (strncmp(request_line, "GET ", 4) == 0 &&
+                                op_strcasestr(request_line, " HTTP/1.1") != NULL);
+            }
+            line++;
+        }
 
         while (line && line < hdr_end)
         {
@@ -654,13 +804,14 @@ op_ws_handshake_read(op_fde_t *F, void *data)
             {
                 *colon = '\0';
                 char *name  = hline;
-                char *value = colon + 1;
-                while (*value == ' ' || *value == '\t') value++;
+                char *value = ws_ltrim(colon + 1);
+                ws_rtrim(name);
+                ws_rtrim(value);
 
                 if (op_strcasecmp(name, "Upgrade") == 0)
-                    have_upgrade = (op_strcasecmp(value, "websocket") == 0);
+                    have_upgrade = ws_token_eq(value, "websocket");
                 else if (op_strcasecmp(name, "Connection") == 0)
-                    have_connection = (op_strcasestr(value, "Upgrade") != NULL);
+                    have_connection = ws_header_has_token(value, "upgrade");
                 else if (op_strcasecmp(name, "Sec-WebSocket-Version") == 0)
                     have_version = (atoi(value) == 13);
                 else if (op_strcasecmp(name, "Sec-WebSocket-Key") == 0)
@@ -676,13 +827,14 @@ op_ws_handshake_read(op_fde_t *F, void *data)
         ws->hs_len = 0;
 
         /* --- Validate -------------------------------------------------- */
-        if (!have_upgrade || !have_connection || !have_version || !client_key[0])
+        if (!have_request || !have_upgrade || !have_connection ||
+            !have_version || !ws_client_key_valid(client_key))
         {
             static const char badreq[] =
                 "HTTP/1.1 400 Bad Request\r\n"
                 "Sec-WebSocket-Version: 13\r\n"
                 "Content-Length: 0\r\n\r\n";
-            (void)send(F->fd, badreq, sizeof(badreq) - 1, MSG_NOSIGNAL);
+            (void)ws_fd_send(F, badreq, sizeof(badreq) - 1);
             goto fail;
         }
 
@@ -698,17 +850,23 @@ op_ws_handshake_read(op_fde_t *F, void *data)
             char *accept = (char *)op_base64_encode(digest, SHA1_DIGEST_LENGTH);
 
             /* Build the 101 response */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
             char response[512];
             int  rlen = 0;
             { int n = snprintf(response + rlen, sizeof(response) - rlen,
                                "%s%s", ws_answer_1, accept);
               if(n > 0) rlen += ((size_t)n >= sizeof(response) - rlen) ? (int)(sizeof(response) - rlen - 1) : n; }
+#pragma GCC diagnostic pop
             op_free(accept);
 
-            if (ws_subproto[0] && op_strcasestr(ws_subproto, "irc"))
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+            if (ws_subproto[0] && ws_header_selects_protocol(ws_subproto, "irc"))
             { int n = snprintf(response + rlen, sizeof(response) - rlen,
                                "\r\nSec-WebSocket-Protocol: irc");
               if(n > 0) rlen += ((size_t)n >= sizeof(response) - rlen) ? (int)(sizeof(response) - rlen - 1) : n; }
+#pragma GCC diagnostic pop
 
             if (rlen + (int)sizeof(ws_answer_2) < (int)sizeof(response))
             {
@@ -824,6 +982,14 @@ op_ws_start_accepted(op_fde_t *F, ACCB *cb, void *data, int timeout)
 ssize_t
 op_ws_read(op_fde_t *F, void *buf, size_t count)
 {
+    if (F == NULL || buf == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (count == 0)
+        return 0;
+
     ws_state_t *ws = (ws_state_t *)F->ws;
     if (!ws || !ws->keyed)
     {
@@ -858,7 +1024,8 @@ op_ws_read(op_fde_t *F, void *buf, size_t count)
         return 0;   /* connection closed */
 
     /* Append raw bytes to inbuf */
-    inbuf_grow(ws, (size_t)nread);
+    if (!inbuf_grow(ws, (size_t)nread))
+        return -1;
     memcpy(ws->inbuf + ws->inbuf_len, tcpbuf, (size_t)nread);
     ws->inbuf_len += (size_t)nread;
 
@@ -884,6 +1051,22 @@ op_ws_read(op_fde_t *F, void *buf, size_t count)
     return -1;
 }
 
+int
+op_ws_pending(const op_fde_t *F)
+{
+    if (!F || !F->ws)
+        return 0;
+    const ws_state_t *ws = (const ws_state_t *)F->ws;
+    if (!ws->keyed)
+        return 0;
+    int n = 0;
+    if (ws->decoded_len > ws->decoded_pos)
+        n += (int)(ws->decoded_len - ws->decoded_pos);
+    if (ws->inbuf_len > 0)
+        n += (int)ws->inbuf_len;
+    return n;
+}
+
 /*
  * op_ws_write — called by op_write() when OP_FD_WEBSOCKET is set.
  *
@@ -897,9 +1080,25 @@ op_ws_read(op_fde_t *F, void *buf, size_t count)
 ssize_t
 op_ws_write(op_fde_t *F, const void *buf, size_t count)
 {
+    if (F == NULL || buf == NULL)
+    {
+        errno = EINVAL;
+        return OP_RW_IO_ERROR;
+    }
+    if (count == 0)
+        return 0;
+    if (count > WS_MAX_MESSAGE_SIZE)
+    {
+        errno = EMSGSIZE;
+        return OP_RW_IO_ERROR;
+    }
+
     ws_state_t *ws = (ws_state_t *)F->ws;
     if (!ws || !ws->keyed)
+    {
+        errno = ENOTCONN;
         return 0;
+    }
 
     /* If there's a pending frame from a previous call, flush it first */
     if (op_rawbuf_length(ws->frame_out) > 0)
@@ -972,4 +1171,3 @@ op_ws_attach_transferred(op_fde_t *F)
     F->type   |= OP_FD_WEBSOCKET;
     F->ws      = ws;
 }
-

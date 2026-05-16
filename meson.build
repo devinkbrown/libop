@@ -82,7 +82,7 @@ _funcs = [
 ]
 
 foreach f : _funcs
-  if cc.has_function(f[1], prefix: f[2])
+  if cc.has_function(f[1], prefix: '#define _GNU_SOURCE\n' + f[2])
     cdata.set(f[0], 1)
   endif
 endforeach

@@ -5,7 +5,7 @@
  * Copyright (C) 1990 Jarkko Oikarinen and University of Oulu, Co Center
  * Copyright (C) 1996-2002 Hybrid Development Team
  * Copyright (C) 2002-2005 ircd-ratbox development team
- * Copyright (C) 2025      ophion development team
+ * Copyright (C) 2025-2026 ophion development team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -39,6 +39,12 @@
 #include <ctype.h>
 #include <time.h>
 #include <sys/types.h>
+
+/* -------------------------------------------------------------------------
+ * C23 compatibility layer — must come before any declarations using OP_* macros
+ * ---------------------------------------------------------------------- */
+
+#include <op_c23.h>
 
 /* -------------------------------------------------------------------------
  * Branch-prediction hints
@@ -281,7 +287,7 @@ char       *op_ctime(time_t t, char *buf, size_t len);
 char       *op_date(time_t t, char *buf, size_t len);
 void        op_lib_log(const char *fmt, ...) AFP(1, 2);
 void        op_lib_set_log_hook(void (*hook)(const char *msg));
-void        op_lib_restart(const char *fmt, ...) __attribute__((noreturn)) AFP(1, 2);
+OP_NORETURN void op_lib_restart(const char *fmt, ...) AFP(1, 2);
 void        op_lib_die(const char *fmt, ...) AFP(1, 2);
 void        op_set_time(void);
 const char *op_lib_version(void);
@@ -305,7 +311,7 @@ const op_build_info_t *op_build_info(void);
 void        op_lib_init(log_cb *ilog, restart_cb *irestart, die_cb *idie,
                         int closeall, int maxfds,
                         size_t dh_size, size_t fd_heap_size);
-void        op_lib_loop(long delay) __attribute__((noreturn));
+OP_NORETURN void op_lib_loop(long delay);
 
 /*
  * op_lib_loop_tick — run exactly one I/O + timer cycle and return.

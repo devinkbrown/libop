@@ -5,7 +5,7 @@
  *  Copyright (C) 1990 Jarkko Oikarinen and University of Oulu, Co Center
  *  Copyright (C) 1996-2002 Hybrid Development Team
  *  Copyright (C) 2002-2005 ircd-ratbox development team
- *  Copyright (C) 2025 ophion development team
+ *  Copyright (C) 2025-2026 ophion development team
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -33,9 +33,16 @@
 
 
 
-void op_outofmemory(void) __attribute__((noreturn));
+OP_NORETURN void op_outofmemory(void);
 
-static inline void *
+
+#pragma GCC diagnostic push
+#ifdef __GNUC__
+#ifndef __clang__
+#pragma GCC diagnostic ignored "-Wclobbered"
+#endif
+#endif
+OP_NODISCARD OP_RETURNS_NONNULL static inline void *
 op_calloc(size_t nmemb, size_t size)
 {
 	void *ret = calloc(nmemb, size);
@@ -44,16 +51,16 @@ op_calloc(size_t nmemb, size_t size)
 	return (ret);
 }
 
-static inline void *
+OP_NODISCARD OP_RETURNS_NONNULL static inline void *
 op_malloc(size_t size)
 {
-	void *ret = calloc(1, size);
+	void *volatile ret = calloc(1, size);
 	if (op_unlikely(ret == NULL))
 		op_outofmemory();
 	return (ret);
 }
 
-static inline void *
+OP_NODISCARD OP_RETURNS_NONNULL static inline void *
 op_realloc(void *x, size_t y)
 {
 	void *ret = realloc(x, y);
@@ -63,7 +70,7 @@ op_realloc(void *x, size_t y)
 	return (ret);
 }
 
-static inline char *
+OP_NODISCARD OP_RETURNS_NONNULL OP_NONNULL(1) static inline char *
 op_strndup(const char *x, size_t y)
 {
 	char *ret = malloc(y);
@@ -73,7 +80,7 @@ op_strndup(const char *x, size_t y)
 	return (ret);
 }
 
-static inline char *
+OP_NODISCARD OP_RETURNS_NONNULL OP_NONNULL(1) static inline char *
 op_strdup(const char *x)
 {
 	char *ret = malloc(strlen(x) + 1);
@@ -90,5 +97,16 @@ op_free(void *ptr)
 	if (op_likely(ptr != NULL))
 		free(ptr);
 }
+
+OP_NODISCARD OP_RETURNS_NONNULL
+static inline void *
+op_calloc_checked(size_t nmemb, size_t size)
+{
+	size_t total;
+	if (op_ckd_mul(&total, nmemb, size))
+		op_outofmemory();
+	return op_calloc(1, total);
+}
+#pragma GCC diagnostic pop
 
 #endif /* LIBOP_MEMORY_H */

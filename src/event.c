@@ -194,6 +194,7 @@ op_event_add_common(const char *name, EVH *func, void *arg,
 	ev->next      = when;
 	ev->frequency = frequency;
 	ev->dead      = 0;
+	ev->comm_ptr  = NULL;
 	ev->hidx      = 0;   /* will be set properly by heap_push */
 	/* Auto-tag with the module currently being loaded (NULL = ircd core). */
 	ev->mod_name  = op_current_loading_module

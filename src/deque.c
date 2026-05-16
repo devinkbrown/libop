@@ -23,6 +23,8 @@ next_pow2(size_t n)
 {
     if (n < DEFAULT_CAP)
         return DEFAULT_CAP;
+    if (op_unlikely(n > SIZE_MAX / 2))
+        abort();
     n--;
     n |= n >> 1;
     n |= n >> 2;
@@ -46,6 +48,8 @@ static void
 deque_grow(op_deque_t *d)
 {
     size_t  new_cap  = d->cap * 2;
+    if (op_unlikely(new_cap < d->cap || new_cap > SIZE_MAX / sizeof(void *)))
+        abort();
     void  **new_slots = op_malloc(new_cap * sizeof(void *));
 
     /* Linearise the existing elements into the new buffer front-to-back. */

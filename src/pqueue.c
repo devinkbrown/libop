@@ -146,6 +146,8 @@ op_pqueue_push(op_pqueue_t *pq, void *elem)
     if (pq->size >= pq->cap)
     {
         size_t new_cap = pq->cap * 2;
+        if (op_unlikely(new_cap < pq->cap || new_cap > SIZE_MAX / sizeof(void *)))
+            abort();
         if (new_cap < PQ_DEFAULT_CAP)
             new_cap = PQ_DEFAULT_CAP;
         pq_resize(pq, new_cap);

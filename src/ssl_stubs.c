@@ -43,6 +43,10 @@ void op_connect_tcp_ssl(op_fde_t *F, struct sockaddr *dest, struct sockaddr *clo
                         CNCB *cb, void *data, int timeout, const char *sni)
 { (void)F; (void)dest; (void)clocal; (void)cb; (void)data; (void)timeout; (void)sni; }
 
+void op_connect_tcp_ssl_ex(op_fde_t *F, struct sockaddr *dest, struct sockaddr *clocal,
+                           CNCB *cb, void *data, int timeout, const char *sni, const char *alpn)
+{ (void)F; (void)dest; (void)clocal; (void)cb; (void)data; (void)timeout; (void)sni; (void)alpn; }
+
 void op_ssl_accept_setup(op_fde_t *F, op_fde_t *new_F, struct sockaddr *st, int addrlen, bool wsock)
 { (void)F; (void)new_F; (void)st; (void)addrlen; (void)wsock; }
 
@@ -78,3 +82,26 @@ int op_ssl_export_keying_material(op_fde_t *F, uint8_t *out, size_t outlen,
                                   const char *label,
                                   const uint8_t *context, size_t context_len)
 { (void)F; (void)out; (void)outlen; (void)label; (void)context; (void)context_len; return 0; }
+
+int op_setup_ssl_server_sni(const char *hostname, const char *cert,
+                             const char *keyfile, const char *dhfile,
+                             const char *cipher_list, bool verify,
+                             const char *ca_cert, const char *min_tls_version)
+{
+    (void)hostname; (void)cert; (void)keyfile; (void)dhfile; (void)cipher_list;
+    (void)verify; (void)ca_cert; (void)min_tls_version;
+    return -1;
+}
+
+int op_supports_ssl(void) { return 0; }
+
+unsigned int op_ssl_handshake_count(op_fde_t *F) { (void)F; return 0; }
+void op_ssl_clear_handshake_count(op_fde_t *F) { (void)F; }
+
+const char *op_ssl_get_cipher(op_fde_t *F) { (void)F; return NULL; }
+
+int op_get_ssl_certfp(op_fde_t *F, uint8_t *certfp, int method)
+{ (void)F; (void)certfp; (void)method; return 0; }
+
+int op_get_ssl_certfp_file(const char *filename, uint8_t *certfp, int method)
+{ (void)filename; (void)certfp; (void)method; return 0; }

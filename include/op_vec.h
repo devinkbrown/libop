@@ -204,4 +204,44 @@ void op_vec_foreach(const op_vec_t *v, op_vec_each_t cb, void *userdata);
          (idx) < (v)->size && ((elem) = (v)->data[(idx)], 1);    \
          (idx)++)
 
+
+/*
+ * op_vec_remove_ptr — find `ptr` by pointer equality and remove it.
+ * No-op if not found.  O(n).
+ */
+static inline void
+op_vec_remove_ptr(op_vec_t *v, const void *ptr)
+{
+	for (size_t i = 0; i < v->size; i++) {
+		if (v->data[i] == ptr) {
+			op_vec_remove_fast(v, i);
+			return;
+		}
+	}
+}
+
+/*
+ * op_vec_contains — return true if ptr is in the vector (pointer equality).
+ */
+static inline bool
+op_vec_contains(const op_vec_t *v, const void *ptr)
+{
+	for (size_t i = 0; i < v->size; i++) {
+		if (v->data[i] == ptr)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * op_vec_move_ptr — remove ptr from src and push onto dst.
+ * No-op if ptr is not in src.
+ */
+static inline void
+op_vec_move_ptr(op_vec_t *src, op_vec_t *dst, void *ptr)
+{
+	op_vec_remove_ptr(src, ptr);
+	op_vec_push(dst, ptr);
+}
+
 #endif /* LIBOP_VEC_H */

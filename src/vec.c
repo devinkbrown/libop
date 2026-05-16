@@ -31,6 +31,8 @@ vec_maybe_grow(op_vec_t *v)
     if (v->size < v->cap)
         return;
     size_t new_cap = v->cap ? v->cap * 2 : VEC_DEFAULT_CAP;
+    if (op_unlikely(new_cap < v->cap || new_cap > SIZE_MAX / sizeof(void *)))
+        abort();
     vec_resize(v, new_cap);
 }
 
